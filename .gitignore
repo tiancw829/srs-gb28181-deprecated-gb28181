@@ -13,6 +13,7 @@
 *.a
 
 .claude
+.claude/*
 CLAUDE.md
 
 # by winlin
