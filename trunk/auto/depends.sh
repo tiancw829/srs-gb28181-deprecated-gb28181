@@ -38,12 +38,20 @@ function Ubuntu_prepare()
         # for debian, we think it's ubuntu also.
         # for example, the wheezy/sid which is debian armv7 linux, can not identified by uname -v.
         if [[ ! -f /etc/debian_version ]]; then
-            return 0;
+            # Check for UOS (UnionTech OS) which is based on Ubuntu/Debian
+            if [[ ! -f /etc/os-version ]]; then
+                return 0;
+            fi
+            # Check if it's UOS
+            grep -i "UnionTech" /etc/os-version >/dev/null 2>&1
+            ret=$?; if [[ 0 -ne $ret ]]; then
+                return 0;
+            fi
         fi
     fi
 
     OS_IS_UBUNTU=YES
-    echo "Installing tools for Ubuntu."
+    echo "Installing tools for Ubuntu/UOS."
     
     gcc --help >/dev/null 2>&1; ret=$?; if [[ 0 -ne $ret ]]; then
         echo "Installing gcc."
@@ -134,12 +142,21 @@ Ubuntu_prepare; ret=$?; if [[ 0 -ne $ret ]]; then echo "Install tools for ubuntu
 OS_IS_CENTOS=NO
 function Centos_prepare()
 {
+    # Check for standard CentOS/RHEL
     if [[ ! -f /etc/redhat-release ]]; then
-        return 0;
+        # Check for KylinOS which is based on CentOS
+        if [[ ! -f /etc/kylin-release ]]; then
+            return 0;
+        fi
+        # Check if it's KylinOS
+        grep -i "Kylin" /etc/kylin-release >/dev/null 2>&1
+        ret=$?; if [[ 0 -ne $ret ]]; then
+            return 0;
+        fi
     fi
 
     OS_IS_CENTOS=YES
-    echo "Installing tools for Centos."
+    echo "Installing tools for Centos/KylinOS."
     
     gcc --help >/dev/null 2>&1; ret=$?; if [[ 0 -ne $ret ]]; then
         echo "Installing gcc."
