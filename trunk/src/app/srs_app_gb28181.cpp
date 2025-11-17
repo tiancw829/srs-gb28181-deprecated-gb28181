@@ -2418,25 +2418,60 @@ srs_error_t SrsGb28181Conn::do_cycle()
         char * buf = mbuffer;
 
         uint32_t index = 0;
-        for( ; index < left_data_len; ){
-            if (index + RTP_TCP_HEADER >= left_data_len){ //less rtp package
+        while (left_data_len - index >= RTP_TCP_HEADER) {
+            uint8_t magic = static_cast<uint8_t>(buf[index]);
+
+            if (magic == 0x24) {
+                if (left_data_len - index < 4) {
+                    break;
+                }
+
+                uint16_t interleaved_len = (static_cast<uint8_t>(buf[index + 2]) << 8) | static_cast<uint8_t>(buf[index + 3]);
+                if (interleaved_len == 0) {
+                    srs_warn("gb28181: ignore empty interleaved packet from %s", remote_ip().c_str());
+                    index += 4;
+                    continue;
+                }
+                if (interleaved_len > MAX_PACKAGE_SIZE) {
+                    srs_error("abnormal interleaved RTP packet length:%d, close the tcp conn:%s", interleaved_len, remote_ip().c_str());
+                    return err;
+                }
+                if (left_data_len - index < 4u + interleaved_len) {
+                    break;
+                }
+
+                processor->on_tcp_packet((sockaddr*)peer_sockaddr, addr_len, buf + index + 4, interleaved_len);
+                index += 4 + interleaved_len;
+                continue;
+            }
+
+            if (left_data_len - index < RTP_TCP_HEADER) {
                 break;
             }
-            packet_len = (((uint8_t *) buf)[index] << 8) | ((uint8_t *) buf)[index + 1];
-            if (packet_len > MAX_PACKAGE_SIZE){
-                //FIXME 自动重新invite?
+
+            packet_len = (static_cast<uint8_t>(buf[index]) << 8) | static_cast<uint8_t>(buf[index + 1]);
+            if (packet_len == 0) {
+                srs_warn("gb28181: ignore empty tcp rtp packet from %s", remote_ip().c_str());
+                index += RTP_TCP_HEADER;
+                continue;
+            }
+            if (packet_len > MAX_PACKAGE_SIZE) {
                 srs_error("abnormal RTP packet length:%d, close the tcp conn:%s", packet_len, remote_ip().c_str());
                 return err;
             }
-            if (index + RTP_TCP_HEADER + packet_len >= left_data_len){
+            if (left_data_len - index < RTP_TCP_HEADER + packet_len) {
                 break;
             }
+
             processor->on_tcp_packet((sockaddr*)peer_sockaddr, addr_len, buf + index + RTP_TCP_HEADER, packet_len);
-            index = index + RTP_TCP_HEADER + packet_len;
+            index += RTP_TCP_HEADER + packet_len;
         }
-        if (index != 0) { //update left data
-            left_data_len = left_data_len - index;
-            memmove(mbuffer, buf + index, left_data_len);
+
+        if (index != 0) {
+            left_data_len -= index;
+            if (left_data_len > 0) {
+                memmove(mbuffer, buf + index, left_data_len);
+            }
         }
 
     }
