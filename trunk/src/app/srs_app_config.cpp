@@ -23,6 +23,7 @@
 
 #include <vector>
 #include <algorithm>
+#include <cctype>
 using namespace std;
 
 #include <srs_kernel_error.hpp>
@@ -3478,18 +3479,53 @@ int SrsConfig::get_stream_caster_listen(SrsConfDirective* conf)
 
 bool SrsConfig::get_stream_caster_tcp_enable(SrsConfDirective* conf)
 {
-	static bool DEFAULT = false;
+    if (!conf) {
+        return false;
+    }
 
-	if (!conf) {
-		return DEFAULT;
-	}
+    conf = conf->get("tcp_enable");
+    if (!conf || conf->arg0().empty()) {
+        return false;
+    }
 
-	conf = conf->get("tcp_enable");
-	if (!conf || conf->arg0().empty()) {
-		return DEFAULT;
-	}
+    std::string v = conf->arg0();
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
 
-	return SRS_CONF_PERFER_FALSE(conf->arg0());
+    if (v == "on" || v == "true" || v == "tcp" || v == "mix" || v == "both" || v == "all" || v == "tcp_udp" || v == "udp_tcp" || v == "dual") {
+        return true;
+    }
+
+    return false;
+}
+
+bool SrsConfig::get_stream_caster_gb28181_udp_enable(SrsConfDirective* conf)
+{
+    if (!conf) {
+        return true;
+    }
+
+    conf = conf->get("tcp_enable");
+    if (!conf || conf->arg0().empty()) {
+        return true;
+    }
+
+    std::string v = conf->arg0();
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    if (v == "on" || v == "true" || v == "tcp") {
+        return false;
+    }
+
+    if (v == "mix" || v == "both" || v == "all" || v == "tcp_udp" || v == "udp_tcp" || v == "dual") {
+        return true;
+    }
+
+    // Treat explicit UDP/off values as UDP enabled.
+    return true;
 }
 
 int SrsConfig::get_stream_caster_rtp_port_min(SrsConfDirective* conf)

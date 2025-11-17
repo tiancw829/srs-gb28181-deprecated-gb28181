@@ -760,7 +760,8 @@ srs_error_t  SrsGb28181SipService::send_invite(SrsSipRequest *req,  string ip, i
     req->from_realm = config->sip_realm;
    
     std::stringstream ss;
-    sip->req_invite(ss, req, ip, port, ssrc, config->rtp_mux_tcp_enable);
+    bool invite_over_tcp = config->rtp_mux_tcp_enable && !config->rtp_mux_udp_enable;
+    sip->req_invite(ss, req, ip, port, ssrc, invite_over_tcp);
    
     sockaddr addr = sip_session->sockaddr_from();
 

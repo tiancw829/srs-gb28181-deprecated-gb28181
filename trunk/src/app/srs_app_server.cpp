@@ -1450,12 +1450,36 @@ srs_error_t SrsServer::listen_stream_caster()
                 }
             }
 
-            //gb28181 stream listener
-            if (!_srs_config->get_stream_caster_tcp_enable(stream_caster)) {
-                listener = new SrsGb28181Listener(this, SrsListenerGb28181RtpMux, stream_caster);
-            } else {
-                listener = new SrsGb28181TcpListener(this, SrsListenerGb28181RtpMux, stream_caster);
+            bool udp_enabled = _srs_config->get_stream_caster_gb28181_udp_enable(stream_caster);
+            bool tcp_enabled = _srs_config->get_stream_caster_tcp_enable(stream_caster);
+            if (!udp_enabled && !tcp_enabled) {
+                udp_enabled = true;
             }
+
+            int port = _srs_config->get_stream_caster_listen(stream_caster);
+            if (port <= 0) {
+                return srs_error_new(ERROR_STREAM_CASTER_PORT, "invalid port=%d", port);
+            }
+
+            if (udp_enabled) {
+                SrsListener* udp_listener = new SrsGb28181Listener(this, SrsListenerGb28181RtpMux, stream_caster);
+                if ((err = udp_listener->listen(srs_any_address_for_listener(), port)) != srs_success) {
+                    srs_freep(udp_listener);
+                    return srs_error_wrap(err, "listen at %d", port);
+                }
+                listeners.push_back(udp_listener);
+            }
+
+            if (tcp_enabled) {
+                SrsListener* tcp_listener = new SrsGb28181TcpListener(this, SrsListenerGb28181RtpMux, stream_caster);
+                if ((err = tcp_listener->listen(srs_any_address_for_listener(), port)) != srs_success) {
+                    srs_freep(tcp_listener);
+                    return srs_error_wrap(err, "listen at %d", port);
+                }
+                listeners.push_back(tcp_listener);
+            }
+
+            continue;
 #else
             srs_warn("gb28181 is disabled, please enable it by: ./configure --with-gb28181");
             continue;

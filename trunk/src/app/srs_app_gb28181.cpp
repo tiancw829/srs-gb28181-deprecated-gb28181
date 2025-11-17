@@ -750,6 +750,10 @@ SrsGb28181Config::SrsGb28181Config(SrsConfDirective* c)
     output = _srs_config->get_stream_caster_output(c);
     rtp_mux_port = _srs_config->get_stream_caster_listen(c);
 	rtp_mux_tcp_enable = _srs_config->get_stream_caster_tcp_enable(c);
+    rtp_mux_udp_enable = _srs_config->get_stream_caster_gb28181_udp_enable(c);
+    if (!rtp_mux_tcp_enable && !rtp_mux_udp_enable) {
+        rtp_mux_udp_enable = true;
+    }
     rtp_port_min = _srs_config->get_stream_caster_rtp_port_min(c);
     rtp_port_max = _srs_config->get_stream_caster_rtp_port_max(c);
     rtp_idle_timeout = _srs_config->get_stream_caster_gb28181_rtp_idle_timeout(c);
@@ -1927,7 +1931,7 @@ void SrsGb28181Manger::rtmpmuxer_unmap_by_ssrc(uint32_t ssrc)
 
 void SrsGb28181Manger::destroy()
 {
-    if (!config->rtp_mux_tcp_enable) {
+    if (config->rtp_mux_udp_enable) {
         //destory ps rtp listen
         std::map<uint32_t, SrsPsRtpListener*>::iterator it;
         for (it = rtp_pool.begin(); it != rtp_pool.end(); ++it) {
@@ -1981,7 +1985,7 @@ srs_error_t SrsGb28181Manger::start_ps_rtp_listen(std::string id, int port)
     //     return srs_error_wrap(err, "start rtp listen port rtmp muxer is null"); 
     // }
 
-    if (!config->rtp_mux_tcp_enable) {
+    if (config->rtp_mux_udp_enable) {
         if (rtp_pool.find(port) == rtp_pool.end())
         {
             SrsPsRtpListener* rtp = new SrsPsRtpListener(this->config, port, id);
@@ -2013,7 +2017,7 @@ void SrsGb28181Manger::stop_rtp_listen(std::string id)
         return; 
     }
 
-    if (!config->rtp_mux_tcp_enable) {
+    if (config->rtp_mux_udp_enable) {
         map<uint32_t, SrsPsRtpListener*>::iterator it2 = rtp_pool.find(port);
         if (it2 != rtp_pool.end()) {
             srs_freep(it2->second);

@@ -371,6 +371,7 @@ public:
     int rtp_port_max;
     int rtp_mux_port;
 	bool rtp_mux_tcp_enable;
+    bool rtp_mux_udp_enable;
     bool auto_create_channel;
 
     //sip config

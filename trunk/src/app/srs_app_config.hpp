@@ -476,6 +476,8 @@ public:
     virtual int get_stream_caster_listen(SrsConfDirective* conf);
     // Get the listen port type of stream caster.
     virtual bool get_stream_caster_tcp_enable(SrsConfDirective* conf);
+    // Whether UDP reception is enabled for gb28181 caster.
+    virtual bool get_stream_caster_gb28181_udp_enable(SrsConfDirective* conf);
     // Get the min udp port for rtp of stream caster rtsp.
     virtual int get_stream_caster_rtp_port_min(SrsConfDirective* conf);
     // Get the max udp port for rtp of stream caster rtsp.
