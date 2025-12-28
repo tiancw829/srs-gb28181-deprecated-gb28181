@@ -296,7 +296,10 @@ private:
 
     uint32_t ps_rtp_video_ts;
 
-    bool source_publish; 
+    bool source_publish;
+    
+    // Flag to only warn once about missing SPS/PPS to avoid log flooding
+    bool warned_no_sps_pps;
 
 public:
     std::queue<SrsPsRtpPacket*> ps_queue;

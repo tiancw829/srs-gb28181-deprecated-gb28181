@@ -815,6 +815,7 @@ SrsGb28181RtmpMuxer::SrsGb28181RtmpMuxer(SrsGb28181Manger* c, std::string id, bo
     server = NULL;
     source = NULL;
     source_publish = true;
+    warned_no_sps_pps = false;
 
     jitter_buffer = new SrsRtpJitterBuffer(id);
     jitter_buffer_audio = new SrsRtpJitterBuffer(id);
@@ -1283,6 +1284,7 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame2(char *frame, int frame_si
             return err;
         }
         h264_sps = sps;
+        warned_no_sps_pps = false; // Reset flag when SPS is received
 
         if ((err = write_h264_sps_pps(dts, pts)) != srs_success) {
             return srs_error_wrap(err, "write sps/pps");
@@ -1301,6 +1303,7 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame2(char *frame, int frame_si
             return err;
         }
         h264_pps = pps;
+        warned_no_sps_pps = false; // Reset flag when PPS is received
         
         if ((err = write_h264_sps_pps(dts, pts)) != srs_success) {
             return srs_error_wrap(err, "write sps/pps");
@@ -1539,6 +1542,16 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame(char* frame, int frame_siz
 {
     srs_error_t err = srs_success;
     
+    // When sps or pps not sent, ignore the packet to prevent decoder failure.
+    // @see https://github.com/ossrs/srs new version implementation
+    if (h264_sps.empty() || h264_pps.empty()) {
+        if (!warned_no_sps_pps) {
+            srs_warn("gb28181: drop frame before sps/pps, size=%d (further warnings suppressed)", frame_size);
+            warned_no_sps_pps = true;
+        }
+        return err;
+    }
+    
     // 5bits, 7.3.1 NAL unit syntax,
     // ISO_IEC_14496-10-AVC-2003.pdf, page 44.
     //  7: SPS, 8: PPS, 5: I Frame, 1: P Frame
@@ -1627,12 +1640,15 @@ srs_error_t SrsGb28181RtmpMuxer::rtmp_write_packet_by_source(char type, uint32_t
         // TODO: FIXME: Maybe the tbn is not 90k.
         header.timestamp = timestamp & 0x3fffffff;
 
-        SrsCommonMessage* shared_video = new SrsCommonMessage();
-        SrsAutoFree(SrsCommonMessage, shared_video);
+        SrsCommonMessage* shared_audio = new SrsCommonMessage();
+        SrsAutoFree(SrsCommonMessage, shared_audio);
 
-        // TODO: FIXME: Check error.
-        shared_video->create(&header, data, size);
-        source->on_audio(shared_video);
+        if ((err = shared_audio->create(&header, data, size)) != srs_success) {
+            return srs_error_wrap(err, "create audio message");
+        }
+        if ((err = source->on_audio(shared_audio)) != srs_success) {
+            return srs_error_wrap(err, "source on_audio");
+        }
     }else if(type == SrsFrameTypeVideo) {
         SrsMessageHeader header;
         header.message_type = RTMP_MSG_VideoMessage;
@@ -1642,9 +1658,12 @@ srs_error_t SrsGb28181RtmpMuxer::rtmp_write_packet_by_source(char type, uint32_t
         SrsCommonMessage* shared_video = new SrsCommonMessage();
         SrsAutoFree(SrsCommonMessage, shared_video);
 
-        // TODO: FIXME: Check error.
-        shared_video->create(&header, data, size);
-        source->on_video(shared_video);
+        if ((err = shared_video->create(&header, data, size)) != srs_success) {
+            return srs_error_wrap(err, "create video message");
+        }
+        if ((err = source->on_video(shared_video)) != srs_success) {
+            return srs_error_wrap(err, "source on_video");
+        }
     }
     
     return err;
