@@ -334,7 +334,8 @@ SrsRtpFrameBufferEnum SrsRtpFrameBuffer::InsertPacket(const VCMPacket& packet, c
         }
 
         VerifyAndAllocate(newSize);
-        UpdateDataPointers(prevBuffer, _buffer);
+        // UpdateDataPointers is now called inside VerifyAndAllocate to ensure safety.
+        // UpdateDataPointers(prevBuffer, _buffer);
 
         srs_trace("RTP: jitbuffer VerifyAndAllocate:newSize:%d, prevBuffer:%d, _buffer:%d", newSize, prevBuffer, _buffer);
     }
@@ -440,6 +441,8 @@ void SrsRtpFrameBuffer::VerifyAndAllocate(const uint32_t minimumSize)
         if (_buffer) {
             // copy old data
             memcpy(newBuffer, _buffer, _size);
+            // Fix: Update pointers BEFORE deleting the old buffer to avoid Use-After-Free.
+            UpdateDataPointers(_buffer, newBuffer);
             delete [] _buffer;
         }
 

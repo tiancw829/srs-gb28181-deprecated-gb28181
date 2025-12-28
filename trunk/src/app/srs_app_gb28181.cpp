@@ -1016,6 +1016,7 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
     srs_error_t err = srs_success;
     recv_rtp_stream_time =  srs_get_system_time();
     send_rtmp_stream_time = srs_get_system_time();
+    srs_utime_t last_decoded_time = srs_get_system_time();
     uint32_t cur_timestamp = 0;
     int buffer_size = 0;
     bool keyframe = false;
@@ -1030,9 +1031,11 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
         }
 
         SrsGb28181Config config = gb28181_manger->get_gb28181_config();
+        bool decoded_any = false;
 
         if (true) {
             if(jitter_buffer->FoundFrame(cur_timestamp)){
+                decoded_any = true;
                 jitter_buffer->GetFrame(&ps_buffer, ps_buflen, buffer_size, keyframe, cur_timestamp);
             
                 if (buffer_size > 0){
@@ -1044,6 +1047,7 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
             }
 
             if(jitter_buffer_audio->FoundFrame(cur_timestamp)){
+                decoded_any = true;
                 jitter_buffer_audio->GetFrame(&ps_buffer_audio, ps_buflen_auido, buffer_size, keyframe, cur_timestamp);
             
                 if (buffer_size > 0){
@@ -1052,6 +1056,21 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
                         srs_freep(err);
                     };
                 }
+            }
+        }
+
+        if (decoded_any) {
+            last_decoded_time = srs_get_system_time();
+        } else {
+            srs_utime_t now = srs_get_system_time();
+            // If we are receiving data (recv_rtp_stream_time is recent) but not decoding for 5 seconds,
+            // it means the jitter buffer might be stuck (e.g. waiting for a missing packet that will never arrive).
+            // We flush it to force recovery.
+            if (now - recv_rtp_stream_time < 2 * SRS_UTIME_SECONDS && now - last_decoded_time > 5 * SRS_UTIME_SECONDS) {
+                 srs_warn("gb28181: jitter buffer stuck (receiving but not decoding), flushing to recover...");
+                 jitter_buffer->Flush();
+                 jitter_buffer_audio->Flush();
+                 last_decoded_time = now;
             }
         }
 
