@@ -2,8 +2,8 @@
 
 listen                  1935;
 max_connections         1000;
-daemon              on;
-#srs_log_tank        console;
+daemon              off;
+srs_log_tank        console;
 
 http_api {
     enabled         on;
@@ -34,7 +34,7 @@ stream_caster {
     listen              9000;
     # 多路复用端口类型，on为tcp，off为udp，mix为同时开启tcp/udp
     # 默认：on
-    tcp_enable            mix;
+    tcp_enable            on;
 
     # rtp接收监听端口范围，最小值
     rtp_port_min        58200;
@@ -70,16 +70,16 @@ stream_caster {
     # $CANDIDATE 是系统环境变量，从环境变量获取地址，如果没有配置，用*
     # *代表指定stats network 的网卡号地址，如果没有配置network，默认则是第0号网卡地址
     # TODO: https://github.com/ossrs/srs/pull/1679/files#r400917594
-    host       10.10.2.63;
+    host       $CANDIDATE;
 
     #根据收到ps rtp包自带创建rtmp媒体通道，不需要api接口创建
     #rtmp地址参数[stream] 就是通道id  格式chid[ssrc]
-    auto_create_channel   on;
+    auto_create_channel   off;
 
     sip {
         # 是否启用srs内部sip信令
         # 为on信令走srs, off 只转发ps流
-        enabled off;
+        enabled on;
         
         # sip监听udp端口
         listen              5060;
@@ -123,13 +123,12 @@ rtc_server {
     #
     # The * means retrieving server IP automatically, from all network interfaces,
     # @see https://github.com/ossrs/srs/issues/307#issuecomment-599028124
-    candidate       10.10.2.63;
+    candidate       $CANDIDATE;
 }
 
 vhost __defaultVhost__ {
     rtc {
         enabled     on;
-        rtmp_to_rtc on;
         bframe      discard;
     }
 
