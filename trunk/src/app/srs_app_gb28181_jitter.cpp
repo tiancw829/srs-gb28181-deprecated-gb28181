@@ -294,6 +294,16 @@ void SrsRtpFrameBuffer::Reset()
     first_packet_seq_num_ = -1;
     last_packet_seq_num_ = -1;
     _length = 0;
+    
+    // Release buffer memory to prevent memory leak when buffer is large
+    // Keep small buffer (up to ~90KB) to avoid frequent reallocation
+    // This threshold balances memory usage vs allocation overhead
+    const uint32_t kBufferReleaseThreshold = kBufferIncStepSizeBytes * 3; // ~90KB
+    if (_size > kBufferReleaseThreshold) {
+        srs_freepa(_buffer);
+        _size = 0;
+        _buffer = NULL;
+    }
 }
 
 size_t SrsRtpFrameBuffer::Length() const
@@ -1682,9 +1692,21 @@ bool SrsRtpJitterBuffer::UpdateNackList(uint16_t sequence_number)
     if (IsNewerSequenceNumber(sequence_number,
                               latest_received_sequence_number_)) {
         // Push any missing sequence numbers to the NACK list.
-        for (uint16_t i = latest_received_sequence_number_ + 1;
-                IsNewerSequenceNumber(sequence_number, i); ++i) {
-            missing_sequence_numbers_.insert(missing_sequence_numbers_.end(), i);
+        // Limit the gap to prevent NACK list explosion
+        // Use uint16_t arithmetic to correctly handle sequence number wrap-around
+        uint16_t gap = static_cast<uint16_t>(sequence_number - latest_received_sequence_number_ - 1);
+        // Use a reasonable default threshold if max_nack_list_size_ is not set
+        size_t gap_threshold = (max_nack_list_size_ > 0) ? (max_nack_list_size_ * 2) : 500;
+        if (gap > gap_threshold) {
+            // Gap too large, likely due to network interruption or sequence wrap
+            // Just mark this as the new baseline without filling the gap
+            srs_warn("RTP: jitbuffer key(%s) sequence gap too large: %d > %d, skip filling NACK list", 
+                     key_.c_str(), gap, (int)gap_threshold);
+        } else {
+            for (uint16_t i = latest_received_sequence_number_ + 1;
+                    IsNewerSequenceNumber(sequence_number, i); ++i) {
+                missing_sequence_numbers_.insert(missing_sequence_numbers_.end(), i);
+            }
         }
 
         if (TooLargeNackList() && !HandleTooLargeNackList()) {
@@ -1714,12 +1736,17 @@ bool SrsRtpJitterBuffer::HandleTooLargeNackList()
 {
     // Recycle frames until the NACK list is small enough. It is likely cheaper to
     // request a key frame than to retransmit this many missing packets.
-    srs_warn("RTP: jitbuffer NACK list has grown too large: %d > %d", 
-                    missing_sequence_numbers_.size(), max_nack_list_size_);
+    srs_warn("RTP: jitbuffer key(%s) NACK list has grown too large: %zu > %zu", 
+                    key_.c_str(), missing_sequence_numbers_.size(), max_nack_list_size_);
     bool key_frame_found = false;
 
     while (TooLargeNackList()) {
         key_frame_found = RecycleFramesUntilKeyFrame();
+        if (!key_frame_found && TooLargeNackList()) {
+            missing_sequence_numbers_.clear();
+            srs_warn("RTP: jitbuffer clear NACK list because no key frame found.");
+            break;
+        }
     }
 
     return key_frame_found;
@@ -1743,12 +1770,17 @@ bool SrsRtpJitterBuffer::HandleTooOldPackets(uint16_t latest_sequence_number)
     bool key_frame_found = false;
     const uint16_t age_of_oldest_missing_packet = latest_sequence_number -
             *missing_sequence_numbers_.begin();
-    srs_warn("RTP: jitbuffer NACK list contains too old sequence numbers: %d > %d",
-                      age_of_oldest_missing_packet,
+    srs_warn("RTP: jitbuffer key(%s) NACK list contains too old sequence numbers: %u > %d",
+                      key_.c_str(), age_of_oldest_missing_packet,
                       max_packet_age_to_nack_);
 
     while (MissingTooOldPacket(latest_sequence_number)) {
         key_frame_found = RecycleFramesUntilKeyFrame();
+        if (!key_frame_found && MissingTooOldPacket(latest_sequence_number)) {
+            missing_sequence_numbers_.clear();
+            srs_warn("RTP: jitbuffer clear NACK list because no key frame found (old packets).");
+            break;
+        }
     }
 
     return key_frame_found;
