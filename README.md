@@ -164,6 +164,7 @@ vhost __defaultVhost__ {
 }
 ```
 
+chmod +x ./etc/init.d/srs
 sudo ./objs/srs -c ./conf/push.gb28181.conf
 
 [2022-04-30 00:26:27.038][Trace][89679][925s1h86] XCORE-SRS/5.0.26(Leo)
