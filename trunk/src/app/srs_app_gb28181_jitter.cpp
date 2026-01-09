@@ -1833,9 +1833,10 @@ bool SrsRtpJitterBuffer::UpdateNackList(uint16_t sequence_number)
         // Limit the gap to prevent NACK list explosion
         // Use uint16_t arithmetic to correctly handle sequence number wrap-around
         uint16_t gap = static_cast<uint16_t>(sequence_number - latest_received_sequence_number_ - 1);
-        // Increase threshold to 1000 for better tolerance of poor network conditions
-        // Use adaptive threshold: at least 1000 or 3x the max NACK list size
-        size_t gap_threshold = srs_max((size_t)1000, (max_nack_list_size_ > 0) ? (max_nack_list_size_ * 3) : 1000);
+        // Lower threshold to 500 for faster recovery in extreme packet loss scenarios
+        // Observed pattern: NACK re-accumulates to 500-1000 within 600ms after Flush
+        // Using 500 provides earlier intervention while avoiding too frequent resets
+        size_t gap_threshold = 500;
         
         // Only log on large gaps or NACK growth (removed frequent trace logs)
         // Use warning level for gaps > 500 or NACK > 400 as they indicate network issues
@@ -1847,35 +1848,17 @@ bool SrsRtpJitterBuffer::UpdateNackList(uint16_t sequence_number)
         
         if (gap > (int64_t)gap_threshold) {
             // Gap too large, likely due to network interruption or sequence wrap
-            // CRITICAL FIX: Must update latest_received_sequence_number_ to prevent memory leak!
-            // Without this update, the next packet will calculate the same large gap again,
-            // continuously trying to fill NACK list and causing memory to grow unbounded.
-            srs_warn("RTP: jitbuffer key(%s) sequence gap too large: %d > %zu, skip filling NACK list, update seq from %d to %d", 
-                     key_.c_str(), gap, gap_threshold, latest_received_sequence_number_, sequence_number);
+            // CRITICAL FIX: Large sequence gaps indicate severe network disruption or stream restart
+            // Partial state cleanup (only NACK/incomplete) is insufficient and causes NACK re-accumulation
+            // MUST use complete Flush() to reset all internal state atomically
+            srs_warn("RTP: jitbuffer key(%s) CRITICAL: sequence gap %d > %zu, triggering COMPLETE state reset", 
+                     key_.c_str(), gap, gap_threshold);
             
-            // Clear old NACK entries as they are likely no longer relevant
-            if (!missing_sequence_numbers_.empty()) {
-                size_t old_size = missing_sequence_numbers_.size();
-                missing_sequence_numbers_.clear();
-                srs_warn("RTP: jitbuffer key(%s) cleared %zu old NACK entries due to sequence jump", 
-                         key_.c_str(), old_size);
-            }
+            // Use Flush() for complete state reset (NACK + decodable + incomplete + last_decoded_state)
+            // This ensures no stale state remains after the gap
+            Flush();
             
-            // OPTIMIZATION: Also flush incomplete frames on large gap to force fresh start
-            // Incomplete frames from before the gap are unlikely to ever complete
-            if (incomplete_frames_.size() > 3) {
-                size_t incomplete_count = incomplete_frames_.size();
-                incomplete_frames_.Reset(&free_frames_);
-                srs_warn("RTP: jitbuffer key(%s) flushed %zu incomplete frames due to large gap",
-                         key_.c_str(), incomplete_count);
-            }
-            
-            // CRITICAL: Force update the sequence number here!
-            // We cannot rely on LatestSequenceNumber() in the caller because when gap > 32768,
-            // IsNewerSequenceNumber() will incorrectly判断 the new sequence as older due to
-            // uint16_t wrap-around arithmetic, causing latest_received_sequence_number_ to not update.
-            // This would cause every subsequent packet to calculate the same large gap,
-            // continuously triggering this code path and potentially causing issues.
+            // Update sequence after flush - this is safe since Flush() cleared all state
             latest_received_sequence_number_ = sequence_number;
         } else {
             for (uint16_t i = latest_received_sequence_number_ + 1;
@@ -1916,6 +1899,16 @@ bool SrsRtpJitterBuffer::HandleTooLargeNackList()
              "decodable=%zu, incomplete=%zu", 
              key_.c_str(), nack_size, max_nack_list_size_,
              decodable_frames_.size(), incomplete_frames_.size());
+    
+    // OPTIMIZATION: In severe packet loss (>50%), attempting frame recycling is futile
+    // Better to immediately Flush and restart cleanly rather than waste CPU cycles
+    if (nack_size > 500) {
+        srs_error("RTP: jitbuffer key(%s) CRITICAL: NACK=%zu indicates sustained packet loss >50%%, forcing FLUSH",
+                  key_.c_str(), nack_size);
+        Flush();
+        return false;  // Request key frame after flush
+    }
+    
     bool key_frame_found = false;
 
     while (TooLargeNackList()) {
