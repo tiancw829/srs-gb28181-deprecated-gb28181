@@ -524,6 +524,9 @@ private:
     uint16_t last_received_sequence_number_;
     bool first_packet_;
     
+    // Counter for periodic memory stats logging (per-instance to avoid static variable issues)
+    uint32_t cleanup_counter_;
+    
 };
 
 #endif

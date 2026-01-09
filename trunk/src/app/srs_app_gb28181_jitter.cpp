@@ -12,6 +12,7 @@
 #include <srs_core_autofree.hpp>
 #include <srs_kernel_buffer.hpp>
 #include <srs_kernel_file.hpp>
+#include <new>  // For std::nothrow
 
 
 using namespace std;
@@ -347,7 +348,7 @@ SrsRtpFrameBufferEnum SrsRtpFrameBuffer::InsertPacket(const VCMPacket& packet, c
         // UpdateDataPointers is now called inside VerifyAndAllocate to ensure safety.
         // UpdateDataPointers(prevBuffer, _buffer);
 
-        srs_trace("RTP: jitbuffer VerifyAndAllocate:newSize:%d, prevBuffer:%d, _buffer:%d", newSize, prevBuffer, _buffer);
+        srs_trace("RTP: jitbuffer VerifyAndAllocate:newSize:%u, prevBuffer:%p, _buffer:%p", newSize, prevBuffer, (void*)_buffer);
     }
 
     // Find the position of this packet in the packet list in sequence number
@@ -417,6 +418,12 @@ SrsRtpFrameBufferEnum SrsRtpFrameBuffer::InsertPacket(const VCMPacket& packet, c
 
     //size_t returnLength = (*packet_list_it).sizeBytes;
     size_t returnLength = InsertBuffer(_buffer, packet_list_it);
+
+    if (returnLength == 0 && packet.sizeBytes > 0) {
+        srs_error("RTP: jitbuffer InsertBuffer failed");
+        packets_.erase(packet_list_it);
+        return kSizeError;
+    }
   
     // update length
     _length = Length() + static_cast<uint32_t>(returnLength);
@@ -434,7 +441,7 @@ SrsRtpFrameBufferEnum SrsRtpFrameBuffer::InsertPacket(const VCMPacket& packet, c
     } else if (decodable()) {
         state_  = kStateDecodable;
         return kDecodableSession;
-    } else if (!complete()) {
+    } else {
         state_ = kStateIncomplete;
         return kIncomplete;
     }
@@ -445,8 +452,15 @@ SrsRtpFrameBufferEnum SrsRtpFrameBuffer::InsertPacket(const VCMPacket& packet, c
 void SrsRtpFrameBuffer::VerifyAndAllocate(const uint32_t minimumSize)
 {
     if (minimumSize > _size) {
-        // create buffer of sufficient size
-        uint8_t* newBuffer = new uint8_t[minimumSize];
+        // Save old buffer pointer for logging BEFORE deletion
+        uint8_t* oldBuffer = _buffer;
+        
+        // create buffer of sufficient size, use nothrow to prevent exception crash
+        uint8_t* newBuffer = new (std::nothrow) uint8_t[minimumSize];
+        if (newBuffer == NULL) {
+            srs_error("RTP: jitbuffer VerifyAndAllocate failed to allocate %u bytes", minimumSize);
+            return;  // Keep using old buffer, graceful degradation
+        }
 
         if (_buffer) {
             // copy old data
@@ -456,8 +470,8 @@ void SrsRtpFrameBuffer::VerifyAndAllocate(const uint32_t minimumSize)
             delete [] _buffer;
         }
 
-        srs_info("RTP: jitbuffer VerifyAndAllocate oldbuffer=%d newbuffer=%d, minimumSize=%d, size=%d", 
-                     _buffer, newBuffer, minimumSize, _size);
+        srs_info("RTP: jitbuffer VerifyAndAllocate oldbuffer=%p newbuffer=%p, minimumSize=%u, size=%zu", 
+                     (void*)oldBuffer, (void*)newBuffer, minimumSize, _size);
 
         _buffer = newBuffer;
         _size = minimumSize;
@@ -506,20 +520,30 @@ size_t SrsRtpFrameBuffer::InsertBuffer(uint8_t* frame_buffer,
         size_t nalu_count = 0;
         const uint8_t* nalu_ptr = packet_buffer + kH264NALHeaderLengthInBytes;
 
-        while (nalu_ptr < packet_buffer + packet.sizeBytes) {
+        const uint8_t* val_end = packet_buffer + packet.sizeBytes;
+
+        while (nalu_ptr + kLengthFieldLength <= val_end) {
             size_t length = BufferToUWord16(nalu_ptr);
+            
+            if (nalu_ptr + kLengthFieldLength + length > val_end) {
+                srs_error("RTP: jitbuffer STAP-A overflow, length=%zu, remain=%ld", length, val_end - nalu_ptr);
+                return 0;
+            }
+
             required_length += length;
             nalu_ptr += kLengthFieldLength + length;
             nalu_count++;
 
-            srs_info("RTP: jitbuffer H264 stap_a length:%d, nalu_count=%d", length, nalu_count);
+            srs_info("RTP: jitbuffer H264 stap_a length:%zu, nalu_count=%zu", length, nalu_count);
         }
 
         size_t total_len = required_length + nalu_count * (kLengthFieldLength) + kH264NALHeaderLengthInBytes;
 
         if (total_len > packet.sizeBytes) {
-            srs_error("RTP: jitbuffer H264 required len %d is biger than packet len %d", total_len, packet.sizeBytes);
-            return -1;
+            srs_error("RTP: jitbuffer H264 required len %zu is bigger than packet len %zu", total_len, packet.sizeBytes);
+            // Return 0 instead of -1 since return type is size_t (unsigned)
+            // This indicates no bytes were inserted
+            return 0;
         }
 
         required_length += nalu_count * (packet.insertStartCode ? kH264StartCodeLengthBytes : 0);
@@ -1065,10 +1089,14 @@ SrsRtpJitterBuffer::SrsRtpJitterBuffer(std::string key):
     frame_counter_(0),
     last_received_timestamp_(0),
     last_received_sequence_number_(0),
-    first_packet_(0)
+    first_packet_(0),
+    cleanup_counter_(0)
 {
     for (int i = 0; i < kStartNumberOfFrames; i++) {
-        free_frames_.push_back(new SrsRtpFrameBuffer());
+        SrsRtpFrameBuffer* frame = new (std::nothrow) SrsRtpFrameBuffer();
+        if (frame != NULL) {
+            free_frames_.push_back(frame);
+        }
     }
 
     wait_cond_t = srs_cond_new();
@@ -1174,6 +1202,17 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::InsertPacket(uint16_t seq, uint32_t ts
             // if (IsPacketRetransmitted(packet)) {
             //     frame->IncrementNackCount();
             // }
+
+            // CRITICAL: Emergency protection against NACK list memory explosion
+            // If NACK list grows beyond a hard limit, force clear it to prevent OOM
+            const size_t kEmergencyNackLimit = 10000;  // Emergency threshold
+            if (missing_sequence_numbers_.size() > kEmergencyNackLimit) {
+                srs_error("RTP: jitbuffer key(%s) EMERGENCY: NACK list size %zu exceeds limit %zu, force clearing to prevent memory exhaustion!",
+                          key_.c_str(), missing_sequence_numbers_.size(), kEmergencyNackLimit);
+                missing_sequence_numbers_.clear();
+                // Reset sequence tracking to prevent immediate refilling
+                latest_received_sequence_number_ = packet.seqNum;
+            }
 
             UpdateNackList(packet.seqNum);
 
@@ -1327,7 +1366,13 @@ bool SrsRtpJitterBuffer::TryToIncreaseJitterBufferSize()
         return false;
     }
 
-    free_frames_.push_back(new SrsRtpFrameBuffer());
+    SrsRtpFrameBuffer* new_frame = new (std::nothrow) SrsRtpFrameBuffer();
+    if (new_frame == NULL) {
+        srs_error("RTP: jitbuffer failed to allocate new frame buffer");
+        return false;
+    }
+    
+    free_frames_.push_back(new_frame);
     ++max_number_of_frames_;
     return true;
 }
@@ -1449,6 +1494,19 @@ void SrsRtpJitterBuffer::CleanUpOldOrEmptyFrames()
 
     if (!last_decoded_state_.in_initial_state()) {
         DropPacketsFromNackList(last_decoded_state_.sequence_num());
+    }
+    
+    // Periodic memory usage warning for monitoring
+    // Use member variable to track per-instance cleanup count
+    ++cleanup_counter_;
+    if (cleanup_counter_ % 1000 == 0) {
+        size_t total_frames = decodable_frames_.size() + incomplete_frames_.size() + free_frames_.size();
+        size_t nack_size = missing_sequence_numbers_.size();
+        if (nack_size > 1000 || total_frames > 100) {
+            srs_warn("RTP: jitbuffer key(%s) memory stats: decodable=%zu, incomplete=%zu, free=%zu, NACK=%zu",
+                     key_.c_str(), decodable_frames_.size(), incomplete_frames_.size(), 
+                     free_frames_.size(), nack_size);
+        }
     }
 }
 
@@ -1623,6 +1681,9 @@ bool SrsRtpJitterBuffer::FoundFrame(uint32_t& time_stamp)
 
 bool SrsRtpJitterBuffer::GetFrame(char **buffer,  int &buf_len, int &size, bool &keyframe, const uint32_t time_stamp)
 {
+    // Initialize keyframe to false to ensure defined behavior
+    keyframe = false;
+    
     SrsRtpFrameBuffer* frame = ExtractAndSetDecode(time_stamp);
 
     if (frame == NULL) {
@@ -1643,7 +1704,15 @@ bool SrsRtpJitterBuffer::GetFrame(char **buffer,  int &buf_len, int &size, bool 
         srs_freepa(*buffer);
 
         int resize = size + kBufferIncStepSizeBytes;
-        *buffer = new char[resize];
+        *buffer = new (std::nothrow) char[resize];
+        
+        if (*buffer == NULL) {
+            srs_error("RTP: jitbuffer key=%s failed to allocate frame buffer size(%d)", 
+                key_.c_str(), resize);
+            ReleaseFrame(frame);
+            buf_len = 0;
+            return false;
+        }
 
         srs_trace("RTP: jitbuffer key=%s reallocate a frame buffer size(%d>%d) resize(%d)", 
             key_.c_str(), size, buf_len, resize);
@@ -1699,9 +1768,19 @@ bool SrsRtpJitterBuffer::UpdateNackList(uint16_t sequence_number)
         size_t gap_threshold = (max_nack_list_size_ > 0) ? (max_nack_list_size_ * 2) : 500;
         if (gap > gap_threshold) {
             // Gap too large, likely due to network interruption or sequence wrap
-            // Just mark this as the new baseline without filling the gap
-            srs_warn("RTP: jitbuffer key(%s) sequence gap too large: %d > %d, skip filling NACK list", 
-                     key_.c_str(), gap, (int)gap_threshold);
+            // CRITICAL FIX: Must update latest_received_sequence_number_ to prevent memory leak!
+            // Without this update, the next packet will calculate the same large gap again,
+            // continuously trying to fill NACK list and causing memory to grow unbounded.
+            srs_warn("RTP: jitbuffer key(%s) sequence gap too large: %d > %d, skip filling NACK list, update seq from %d to %d", 
+                     key_.c_str(), gap, (int)gap_threshold, latest_received_sequence_number_, sequence_number);
+            
+            // Clear old NACK entries as they are likely no longer relevant
+            if (!missing_sequence_numbers_.empty()) {
+                size_t old_size = missing_sequence_numbers_.size();
+                missing_sequence_numbers_.clear();
+                srs_warn("RTP: jitbuffer key(%s) cleared %zu old NACK entries due to sequence jump", 
+                         key_.c_str(), old_size);
+            }
         } else {
             for (uint16_t i = latest_received_sequence_number_ + 1;
                     IsNewerSequenceNumber(sequence_number, i); ++i) {
