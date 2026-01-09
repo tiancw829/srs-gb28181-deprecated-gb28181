@@ -299,9 +299,9 @@ void SrsRtpFrameBuffer::Reset()
     _length = 0;
     
     // Release buffer memory to prevent memory leak when buffer is large
-    // Keep small buffer (up to ~90KB) to avoid frequent reallocation
-    // This threshold balances memory usage vs allocation overhead
-    const uint32_t kBufferReleaseThreshold = kBufferIncStepSizeBytes * 3; // ~90KB
+    // Increase threshold to 120KB to reduce reallocation frequency under high bitrate
+    // This helps with the frequent 30K->90K->210K->450K growth pattern seen in logs
+    const uint32_t kBufferReleaseThreshold = kBufferIncStepSizeBytes * 4; // ~120KB
     if (_size > kBufferReleaseThreshold) {
         srs_freepa(_buffer);
         _size = 0;
@@ -348,9 +348,7 @@ SrsRtpFrameBufferEnum SrsRtpFrameBuffer::InsertPacket(const VCMPacket& packet, c
 
         VerifyAndAllocate(newSize);
         // UpdateDataPointers is now called inside VerifyAndAllocate to ensure safety.
-        // UpdateDataPointers(prevBuffer, _buffer);
-
-        srs_trace("RTP: jitbuffer VerifyAndAllocate:newSize:%u, prevBuffer:%p, _buffer:%p", newSize, prevBuffer, (void*)_buffer);
+        // Removed frequent VerifyAndAllocate trace log (logged inside VerifyAndAllocate for large allocations)
     }
 
     // Find the position of this packet in the packet list in sequence number
@@ -472,8 +470,11 @@ void SrsRtpFrameBuffer::VerifyAndAllocate(const uint32_t minimumSize)
             delete [] _buffer;
         }
 
-        srs_info("RTP: jitbuffer VerifyAndAllocate oldbuffer=%p newbuffer=%p, minimumSize=%u, size=%zu", 
-                     (void*)oldBuffer, (void*)newBuffer, minimumSize, _size);
+        // Only log significant allocations (>90KB) to reduce log noise
+        if (minimumSize >= 90000) {
+            srs_info("RTP: jitbuffer key=%s VerifyAndAllocate: %zu -> %u bytes", 
+                     "", _size, minimumSize);
+        }
 
         _buffer = newBuffer;
         _size = minimumSize;
@@ -536,7 +537,7 @@ size_t SrsRtpFrameBuffer::InsertBuffer(uint8_t* frame_buffer,
             nalu_ptr += kLengthFieldLength + length;
             nalu_count++;
 
-            srs_info("RTP: jitbuffer H264 stap_a length:%zu, nalu_count=%zu", length, nalu_count);
+            // Removed frequent stap_a log - only error cases are logged below
         }
 
         size_t total_len = required_length + nalu_count * (kLengthFieldLength) + kH264NALHeaderLengthInBytes;
@@ -1131,6 +1132,14 @@ void SrsRtpJitterBuffer::SetDecodeErrorMode(SrsRtpDecodeErrorMode error_mode)
 
 void SrsRtpJitterBuffer::Flush()
 {
+    // Record state before flushing for debugging
+    size_t nack_size = missing_sequence_numbers_.size();
+    size_t decodable_size = decodable_frames_.size();
+    size_t incomplete_size = incomplete_frames_.size();
+    
+    srs_warn("RTP: jitbuffer key(%s) FLUSHING all state: NACK=%zu, decodable=%zu, incomplete=%zu, free=%zu",
+             key_.c_str(), nack_size, decodable_size, incomplete_size, free_frames_.size());
+    
     //CriticalSectionScoped cs(crit_sect_);
     decodable_frames_.Reset(&free_frames_);
     incomplete_frames_.Reset(&free_frames_);
@@ -1145,6 +1154,9 @@ void SrsRtpJitterBuffer::Flush()
     //waiting_for_completion_.latest_packet_time = -1;
     first_packet_since_reset_ = true;
     missing_sequence_numbers_.clear();
+    
+    srs_warn("RTP: jitbuffer key(%s) FLUSH completed, free_frames=%zu/%d",
+             key_.c_str(), free_frames_.size(), max_number_of_frames_);
 }
 
 void SrsRtpJitterBuffer::ResetJittter()
@@ -1163,6 +1175,15 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::InsertPacket(uint16_t seq, uint32_t ts
         kH264SingleNalu, kRtpVideoPS, true, isFirstPacketInFrame, kVideoFrameDelta);
    
     ++num_packets_;
+    
+    // Health check: only log when NACK > 300 (indicates serious network issues)
+    if (num_packets_ % 200 == 0) {
+        size_t nack_size = missing_sequence_numbers_.size();
+        if (nack_size > 300) {
+            srs_warn("RTP: jitbuffer key(%s) health warning: NACK=%zu, decodable=%zu, incomplete=%zu (poor network)",
+                     key_.c_str(), nack_size, decodable_frames_.size(), incomplete_frames_.size());
+        }
+    }
 
     if (num_packets_ == 1) {
         time_first_packet_ms_ =  srs_update_system_time();
@@ -1205,18 +1226,19 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::InsertPacket(uint16_t seq, uint32_t ts
             //     frame->IncrementNackCount();
             // }
 
-            // CRITICAL: Emergency protection against NACK list memory explosion
-            // If NACK list grows beyond a hard limit, force clear it to prevent OOM
-            const size_t kEmergencyNackLimit = 10000;  // Emergency threshold
-            if (missing_sequence_numbers_.size() > kEmergencyNackLimit) {
-                srs_error("RTP: jitbuffer key(%s) EMERGENCY: NACK list size %zu exceeds limit %zu, force clearing to prevent memory exhaustion!",
-                          key_.c_str(), missing_sequence_numbers_.size(), kEmergencyNackLimit);
-                missing_sequence_numbers_.clear();
-                // Reset sequence tracking to prevent immediate refilling
-                latest_received_sequence_number_ = packet.seqNum;
-            }
-
+            // Update NACK list first, then check size
             UpdateNackList(packet.seqNum);
+
+            // CRITICAL: Check NACK size immediately after UpdateNackList
+            // Lowered threshold from 800 to 600 for more aggressive cleanup under poor network
+            // This prevents NACK explosion between GetFrame() calls
+            const size_t kEmergencyNackLimit = 600;
+            if (missing_sequence_numbers_.size() > kEmergencyNackLimit) {
+                srs_error("RTP: jitbuffer key(%s) EMERGENCY in InsertPacket: NACK=%zu > %zu, forcing COMPLETE FLUSH!",
+                          key_.c_str(), missing_sequence_numbers_.size(), kEmergencyNackLimit);
+                // Use Flush() for complete state reset instead of partial cleanup
+                Flush();
+            }
 
             latest_received_sequence_number_ = LatestSequenceNumber(
                                                    latest_received_sequence_number_, packet.seqNum);
@@ -1303,6 +1325,9 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::InsertPacket(uint16_t seq, uint32_t ts
     }
 
     case kFlushIndicator:{
+            // CRITICAL: Log flush indicator trigger for debugging
+            srs_warn("RTP: jitbuffer key(%s) InsertPacket: kFlushIndicator triggered, ts=%u, seq=%u",
+                     key_.c_str(), packet.timestamp, packet.seqNum);
             // Reset to release buffer memory before recycling
             frame->Reset();
             free_frames_.push_back(frame);
@@ -1407,7 +1432,8 @@ bool SrsRtpJitterBuffer::RecycleFramesUntilKeyFrame()
     }
 
     if (key_frame_found) {
-        //LOG(LS_INFO) << "Found key frame while dropping frames.";
+        srs_warn("RTP: jitbuffer key(%s) RecycleFramesUntilKeyFrame: found keyframe after dropping %d frames, seq=%d",
+                 key_.c_str(), dropped_frames, EstimatedLowSequenceNumber(*key_frame_it->second));
         // Reset last decoded state to make sure the next frame decoded is a key
         // frame, and start NACKing from here.
         last_decoded_state_.Reset();
@@ -1506,17 +1532,25 @@ void SrsRtpJitterBuffer::CleanUpOldOrEmptyFrames()
         DropPacketsFromNackList(last_decoded_state_.sequence_num());
     }
     
-    // Periodic memory usage warning for monitoring
-    // Use member variable to track per-instance cleanup count
+    // Periodic health check - only log abnormal conditions
     ++cleanup_counter_;
-    if (cleanup_counter_ % 1000 == 0) {
-        size_t total_frames = decodable_frames_.size() + incomplete_frames_.size() + free_frames_.size();
+    if (cleanup_counter_ % 5000 == 0) {  // Every ~5000 cleanups (~几分钟)
         size_t nack_size = missing_sequence_numbers_.size();
-        if (nack_size > 1000 || total_frames > 100) {
-            srs_warn("RTP: jitbuffer key(%s) memory stats: decodable=%zu, incomplete=%zu, free=%zu, NACK=%zu",
-                     key_.c_str(), decodable_frames_.size(), incomplete_frames_.size(), 
-                     free_frames_.size(), nack_size);
+        float dup_rate = (num_packets_ > 0) ? (num_duplicated_packets_ * 100.0f / num_packets_) : 0.0f;
+        // Only warn if metrics indicate problems
+        if (nack_size > 400 || dup_rate > 15.0f || incomplete_frames_.size() > 20) {
+            srs_warn("RTP: jitbuffer key(%s) health: NACK=%zu, incomplete=%zu, dup=%.1f%% (degraded performance)",
+                     key_.c_str(), nack_size, incomplete_frames_.size(), dup_rate);
         }
+    }
+    
+    // CRITICAL: Emergency recovery - lowered threshold from 800 to 600 for faster response
+    const size_t kEmergencyNackThreshold = 600;
+    if (missing_sequence_numbers_.size() > kEmergencyNackThreshold) {
+        srs_error("RTP: jitbuffer key(%s) EMERGENCY in CleanUp: NACK=%zu > %zu, forcing COMPLETE FLUSH!",
+                  key_.c_str(), missing_sequence_numbers_.size(), kEmergencyNackThreshold);
+        // Use Flush() for complete state reset - this is more reliable than partial cleanup
+        Flush();
     }
 }
 
@@ -1587,8 +1621,18 @@ bool SrsRtpJitterBuffer::NextMaybeIncompleteTimestamp(uint32_t* timestamp)
 
     if (decodable_frames_.empty()) {
         //in order to solve the problem of bad network, we can wait for more incomplete frames
-        //ex fps=15
-        if (incomplete_frames_.size() < 15) {
+        //ex fps=15, but reduce to 8 for faster response under poor network
+        if (incomplete_frames_.size() < 8) {
+            return false;
+        }
+        
+        // CRITICAL: If we have very few incomplete frames and no decodable frames,
+        // it likely means severe packet loss or sequence disruption.
+        // Force flush to recover instead of accumulating garbage.
+        if (incomplete_frames_.size() < 3 && missing_sequence_numbers_.size() > 500) {
+            srs_error("RTP: jitbuffer key(%s) CRITICAL: sequence disruption detected, forcing flush: incomplete=%zu, NACK=%zu",
+                     key_.c_str(), incomplete_frames_.size(), missing_sequence_numbers_.size());
+            Flush();
             return false;
         }
 
@@ -1632,6 +1676,8 @@ bool SrsRtpJitterBuffer::NextMaybeIncompleteTimestamp(uint32_t* timestamp)
 
 SrsRtpFrameBuffer* SrsRtpJitterBuffer::ExtractAndSetDecode(uint32_t timestamp)
 {
+    // Removed frequent trace logs
+    
     // Extract the frame with the desired timestamp.
     SrsRtpFrameBuffer* frame = decodable_frames_.PopFrame(timestamp);
     bool continuous = true;
@@ -1682,6 +1728,7 @@ void SrsRtpJitterBuffer::ReleaseFrame(SrsRtpFrameBuffer* frame)
 
 bool SrsRtpJitterBuffer::FoundFrame(uint32_t& time_stamp)
 {
+    // Removed frequent trace logs - only异常情况 will be logged elsewhere
     
     bool found_frame = NextCompleteTimestamp(0, &time_stamp);
 
@@ -1694,6 +1741,8 @@ bool SrsRtpJitterBuffer::FoundFrame(uint32_t& time_stamp)
 
 bool SrsRtpJitterBuffer::GetFrame(char **buffer,  int &buf_len, int &size, bool &keyframe, const uint32_t time_stamp)
 {
+    // Removed frequent trace logs to reduce noise
+    
     // Initialize keyframe to false to ensure defined behavior
     keyframe = false;
     
@@ -1731,8 +1780,11 @@ bool SrsRtpJitterBuffer::GetFrame(char **buffer,  int &buf_len, int &size, bool 
             return false;
         }
 
-        srs_trace("RTP: jitbuffer key=%s reallocate a frame buffer size(%d>%d) resize(%d)", 
-            key_.c_str(), size, buf_len, resize);
+        // Only log reallocations > 100KB to reduce noise
+        if (resize > 100000) {
+            srs_info("RTP: jitbuffer key=%s reallocate frame buffer: %d -> %d bytes", 
+                key_.c_str(), buf_len, resize);
+        }
             
         buf_len = resize;
     }
@@ -1781,15 +1833,25 @@ bool SrsRtpJitterBuffer::UpdateNackList(uint16_t sequence_number)
         // Limit the gap to prevent NACK list explosion
         // Use uint16_t arithmetic to correctly handle sequence number wrap-around
         uint16_t gap = static_cast<uint16_t>(sequence_number - latest_received_sequence_number_ - 1);
-        // Use a reasonable default threshold if max_nack_list_size_ is not set
-        size_t gap_threshold = (max_nack_list_size_ > 0) ? (max_nack_list_size_ * 2) : 500;
-        if (gap > gap_threshold) {
+        // Increase threshold to 1000 for better tolerance of poor network conditions
+        // Use adaptive threshold: at least 1000 or 3x the max NACK list size
+        size_t gap_threshold = srs_max((size_t)1000, (max_nack_list_size_ > 0) ? (max_nack_list_size_ * 3) : 1000);
+        
+        // Only log on large gaps or NACK growth (removed frequent trace logs)
+        // Use warning level for gaps > 500 or NACK > 400 as they indicate network issues
+        if (gap > 500 || missing_sequence_numbers_.size() > 400) {
+            srs_warn("RTP: jitbuffer key(%s) UpdateNackList: seq [%u -> %u], gap=%d, NACK=%zu (network issue)",
+                     key_.c_str(), latest_received_sequence_number_, sequence_number, gap,
+                     missing_sequence_numbers_.size());
+        }
+        
+        if (gap > (int64_t)gap_threshold) {
             // Gap too large, likely due to network interruption or sequence wrap
             // CRITICAL FIX: Must update latest_received_sequence_number_ to prevent memory leak!
             // Without this update, the next packet will calculate the same large gap again,
             // continuously trying to fill NACK list and causing memory to grow unbounded.
-            srs_warn("RTP: jitbuffer key(%s) sequence gap too large: %d > %d, skip filling NACK list, update seq from %d to %d", 
-                     key_.c_str(), gap, (int)gap_threshold, latest_received_sequence_number_, sequence_number);
+            srs_warn("RTP: jitbuffer key(%s) sequence gap too large: %d > %zu, skip filling NACK list, update seq from %d to %d", 
+                     key_.c_str(), gap, gap_threshold, latest_received_sequence_number_, sequence_number);
             
             // Clear old NACK entries as they are likely no longer relevant
             if (!missing_sequence_numbers_.empty()) {
@@ -1797,6 +1859,15 @@ bool SrsRtpJitterBuffer::UpdateNackList(uint16_t sequence_number)
                 missing_sequence_numbers_.clear();
                 srs_warn("RTP: jitbuffer key(%s) cleared %zu old NACK entries due to sequence jump", 
                          key_.c_str(), old_size);
+            }
+            
+            // OPTIMIZATION: Also flush incomplete frames on large gap to force fresh start
+            // Incomplete frames from before the gap are unlikely to ever complete
+            if (incomplete_frames_.size() > 3) {
+                size_t incomplete_count = incomplete_frames_.size();
+                incomplete_frames_.Reset(&free_frames_);
+                srs_warn("RTP: jitbuffer key(%s) flushed %zu incomplete frames due to large gap",
+                         key_.c_str(), incomplete_count);
             }
             
             // CRITICAL: Force update the sequence number here!
@@ -1840,15 +1911,19 @@ bool SrsRtpJitterBuffer::HandleTooLargeNackList()
 {
     // Recycle frames until the NACK list is small enough. It is likely cheaper to
     // request a key frame than to retransmit this many missing packets.
-    srs_warn("RTP: jitbuffer key(%s) NACK list has grown too large: %zu > %zu", 
-                    key_.c_str(), missing_sequence_numbers_.size(), max_nack_list_size_);
+    size_t nack_size = missing_sequence_numbers_.size();
+    srs_warn("RTP: jitbuffer key(%s) NACK list has grown too large: %zu > %zu, "
+             "decodable=%zu, incomplete=%zu", 
+             key_.c_str(), nack_size, max_nack_list_size_,
+             decodable_frames_.size(), incomplete_frames_.size());
     bool key_frame_found = false;
 
     while (TooLargeNackList()) {
         key_frame_found = RecycleFramesUntilKeyFrame();
         if (!key_frame_found && TooLargeNackList()) {
             missing_sequence_numbers_.clear();
-            srs_warn("RTP: jitbuffer clear NACK list because no key frame found.");
+            srs_warn("RTP: jitbuffer key(%s) clear NACK list (was %zu) because no key frame found.",
+                     key_.c_str(), nack_size);
             break;
         }
     }
@@ -1874,15 +1949,18 @@ bool SrsRtpJitterBuffer::HandleTooOldPackets(uint16_t latest_sequence_number)
     bool key_frame_found = false;
     const uint16_t age_of_oldest_missing_packet = latest_sequence_number -
             *missing_sequence_numbers_.begin();
-    srs_warn("RTP: jitbuffer key(%s) NACK list contains too old sequence numbers: %u > %d",
-                      key_.c_str(), age_of_oldest_missing_packet,
-                      max_packet_age_to_nack_);
+    size_t nack_size = missing_sequence_numbers_.size();
+    srs_warn("RTP: jitbuffer key(%s) NACK list contains too old sequence numbers: %u > %d, "
+             "NACK_size=%zu, oldest_missing=%u, latest=%u",
+             key_.c_str(), age_of_oldest_missing_packet, max_packet_age_to_nack_,
+             nack_size, *missing_sequence_numbers_.begin(), latest_sequence_number);
 
     while (MissingTooOldPacket(latest_sequence_number)) {
         key_frame_found = RecycleFramesUntilKeyFrame();
         if (!key_frame_found && MissingTooOldPacket(latest_sequence_number)) {
             missing_sequence_numbers_.clear();
-            srs_warn("RTP: jitbuffer clear NACK list because no key frame found (old packets).");
+            srs_warn("RTP: jitbuffer key(%s) clear NACK list (was %zu) because no key frame found (old packets).",
+                     key_.c_str(), nack_size);
             break;
         }
     }
@@ -1934,7 +2012,9 @@ void SrsRtpJitterBuffer::SetNackSettings(size_t max_nack_list_size,
     assert(max_packet_age_to_nack >= 0);
     assert(max_incomplete_time_ms_ >= 0);
     max_nack_list_size_ = max_nack_list_size;
-    max_packet_age_to_nack_ = max_packet_age_to_nack;
+    // OPTIMIZATION: Reduce threshold from 450 (15s @ 30fps) to 150 (5s) for faster key frame request
+    // In severe packet loss scenarios (like gap=5261), waiting 15s is too long
+    max_packet_age_to_nack_ = srs_min(max_packet_age_to_nack, 150);
     max_incomplete_time_ms_ = max_incomplete_time_ms;
     nack_seq_nums_.resize(max_nack_list_size_);
 }
