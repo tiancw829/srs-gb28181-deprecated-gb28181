@@ -119,6 +119,8 @@ void FrameList::CleanUpOldOrEmptyFrames(SrsRtpDecodingState* decoding_state, Uno
             break;
         }
 
+        // CRITICAL: Must call Reset() to release large buffer memory before recycling
+        oldest_frame->Reset();
         free_frames->push_back(oldest_frame);
         erase(begin());
     }
@@ -1228,6 +1230,8 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::InsertPacket(uint16_t seq, uint32_t ts
     case kGeneralError:
     case kTimeStampError:
     case kSizeError: {
+        // Reset to release buffer memory before recycling
+        frame->Reset();
         free_frames_.push_back(frame);
         break;
     }
@@ -1267,6 +1271,8 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::InsertPacket(uint16_t seq, uint32_t ts
     case kIncomplete: {
         if (frame->GetState() == kStateEmpty &&
                 last_decoded_state_.UpdateEmptyFrame(frame)) {
+            // Reset to release buffer memory before recycling
+            frame->Reset();
             free_frames_.push_back(frame);
             return kNoError;
         } else {
@@ -1297,6 +1303,8 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::InsertPacket(uint16_t seq, uint32_t ts
     }
 
     case kFlushIndicator:{
+            // Reset to release buffer memory before recycling
+            frame->Reset();
             free_frames_.push_back(frame);
         }
         return kFlushIndicator;
@@ -1338,6 +1346,8 @@ SrsRtpFrameBufferEnum SrsRtpJitterBuffer::GetFrameByRtpPacket(const VCMPacket& p
         assert(*frame);
 
         if (!found_key_frame) {
+            // Reset to release buffer memory before recycling
+            (*frame)->Reset();
             free_frames_.push_back(*frame);
             return kFlushIndicator;
         }
@@ -1663,6 +1673,9 @@ void SrsRtpJitterBuffer::ReleaseFrame(SrsRtpFrameBuffer* frame)
     //VCMFrameBuffer* frame_buffer = static_cast<VCMFrameBuffer*>(frame);
    
     if (frame) {
+        // CRITICAL: Must call Reset() to release large buffer memory
+        // Without this, the buffer memory will accumulate in free_frames_
+        frame->Reset();
         free_frames_.push_back(frame);
     }
 }
@@ -1692,10 +1705,14 @@ bool SrsRtpJitterBuffer::GetFrame(char **buffer,  int &buf_len, int &size, bool 
 
     size = frame->Length();
     if (size <= 0){
+        // CRITICAL: Must release frame to avoid memory leak
+        ReleaseFrame(frame);
         return false;
     }
 
     if (buffer == NULL){
+        // CRITICAL: Must release frame to avoid memory leak
+        ReleaseFrame(frame);
         return false;
     }
    
@@ -1781,6 +1798,14 @@ bool SrsRtpJitterBuffer::UpdateNackList(uint16_t sequence_number)
                 srs_warn("RTP: jitbuffer key(%s) cleared %zu old NACK entries due to sequence jump", 
                          key_.c_str(), old_size);
             }
+            
+            // CRITICAL: Force update the sequence number here!
+            // We cannot rely on LatestSequenceNumber() in the caller because when gap > 32768,
+            // IsNewerSequenceNumber() will incorrectly判断 the new sequence as older due to
+            // uint16_t wrap-around arithmetic, causing latest_received_sequence_number_ to not update.
+            // This would cause every subsequent packet to calculate the same large gap,
+            // continuously triggering this code path and potentially causing issues.
+            latest_received_sequence_number_ = sequence_number;
         } else {
             for (uint16_t i = latest_received_sequence_number_ + 1;
                     IsNewerSequenceNumber(sequence_number, i); ++i) {
