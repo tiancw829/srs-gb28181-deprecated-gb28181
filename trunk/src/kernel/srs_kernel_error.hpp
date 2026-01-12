@@ -371,6 +371,9 @@
 #define ERROR_GB28181_SIP_PTZ_CMD_INVALID   6018
 #define ERROR_GB28181_H264_FRAMESIZE        6019
 #define ERROR_GB28181_H264_FRAME_FULL       6020
+#define ERROR_GB28181_PACKET_INVALID        6021
+#define ERROR_GB28181_PACKET_LENGTH         6022
+#define ERROR_GB28181_RTP_DECODE            6023
 
 ///////////////////////////////////////////////////////
 // HTTP API error.

@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <cstring>
 
 using namespace std;
 
@@ -185,7 +186,9 @@ srs_error_t SrsGb28181PsRtpProcessor::on_udp_packet(const sockaddr* from, const 
 
 srs_error_t SrsGb28181PsRtpProcessor::on_tcp_packet(const sockaddr* from, const int fromlen, char* buf, int nb_buf)
 {
-    return on_udp_packet(from, fromlen, buf, nb_buf);
+    // TCP packet already de-framed by SrsGb28181Conn, directly process as RTP
+    // Note: TCP framing is different from UDP, but RTP payload is the same
+    return on_rtp_packet_jitter(from, fromlen, buf, nb_buf);
 }
 
 SrsGb28181RtmpMuxer* SrsGb28181PsRtpProcessor::fetch_rtmpmuxer(std::string channel_id, uint32_t ssrc)
@@ -270,47 +273,48 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
                 (char*)&address_string, sizeof(address_string),
                 (char*)&port_string, sizeof(port_string),
                 NI_NUMERICHOST|NI_NUMERICSERV)){
-        // return srs_error_new(ERROR_SYSTEM_IP_INVALID, "bad address");
-        srs_warn("gb28181 ps rtp: bad address");
+        srs_warn("gb28181 ps rtp: bad address, ignore packet");
         return srs_success;
     }
     
     int peer_port = atoi(port_string);
 
-    if (true) {
-        SrsBuffer stream(buf, nb_buf);
-        SrsPsRtpPacket *pkt = new SrsPsRtpPacket();;
-        
-        if ((err = pkt->decode(&stream)) != srs_success) {
-            srs_freep(pkt);
-            // return srs_error_wrap(err, "ps rtp decode error");
-            srs_warn("gb28181 ps rtp: decode error");
-            srs_freep(err);
-            return srs_success;
-        }
-        
-        std::stringstream ss3;
-        ss3 << pkt->ssrc << ":" << port_string;
-        std::string jitter_key = ss3.str();
-        
-        pkt->completed = pkt->marker;
-        
-        
-        if (pprint->can_print()) {
-            srs_trace("<- " SRS_CONSTS_LOG_GB28181_CASTER " gb28181: client_id %s, peer(%s, %d) ps rtp packet %dB, age=%d, vt=%d/%u, sts=%u/%u/%#x, paylod=%dB",
-                        channel_id.c_str(),  address_string, peer_port, nb_buf, pprint->age(), pkt->version, 
-                        pkt->payload_type, pkt->sequence_number, pkt->timestamp, pkt->ssrc,
-                        pkt->payload->length()
-                        );
-        }
-      
-        SrsGb28181RtmpMuxer *muxer = fetch_rtmpmuxer(channel_id,  pkt->ssrc);
-        if (muxer){
-            rtmpmuxer_enqueue_data(muxer, pkt->ssrc, peer_port, address_string, pkt);
-        }
-     
-        SrsAutoFree(SrsPsRtpPacket, pkt);
+    // Validate buffer size
+    if (nb_buf < 12) { // Minimum RTP header size
+        srs_warn("gb28181 ps rtp: packet too small %d bytes, peer=%s:%d", nb_buf, address_string, peer_port);
+        return srs_success;
     }
+
+    SrsBuffer stream(buf, nb_buf);
+    SrsPsRtpPacket *pkt = new SrsPsRtpPacket();
+    SrsAutoFree(SrsPsRtpPacket, pkt); // Ensure pkt is always freed
+    
+    if ((err = pkt->decode(&stream)) != srs_success) {
+        srs_warn("gb28181 ps rtp: decode error %s, peer=%s:%d, size=%d",
+                 srs_error_desc(err).c_str(), address_string, peer_port, nb_buf);
+        srs_freep(err);
+        return srs_success; // pkt will be freed by SrsAutoFree
+    }
+    
+    std::stringstream ss3;
+    ss3 << pkt->ssrc << ":" << port_string;
+    std::string jitter_key = ss3.str();
+    
+    pkt->completed = pkt->marker;
+    
+    if (pprint->can_print()) {
+        srs_trace("<- " SRS_CONSTS_LOG_GB28181_CASTER " gb28181: client_id %s, peer(%s, %d) ps rtp packet %dB, age=%d, vt=%d/%u, sts=%u/%u/%#x, paylod=%dB",
+                    channel_id.c_str(),  address_string, peer_port, nb_buf, pprint->age(), pkt->version, 
+                    pkt->payload_type, pkt->sequence_number, pkt->timestamp, pkt->ssrc,
+                    pkt->payload->length()
+                    );
+    }
+  
+    SrsGb28181RtmpMuxer *muxer = fetch_rtmpmuxer(channel_id, pkt->ssrc);
+    if (muxer){
+        rtmpmuxer_enqueue_data(muxer, pkt->ssrc, peer_port, address_string, pkt);
+    }
+    // pkt will be automatically freed by SrsAutoFree when function returns
 
     return err;
 }
@@ -1142,10 +1146,19 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
         
     recv_rtp_stream_time = srs_get_system_time();
 
-    char *payload = pkt->payload->bytes();
-    if (!payload) {
+    // Validate payload exists and has minimum required length
+    if (!pkt->payload || pkt->payload->length() < 4) {
+        // Payload too small, still insert but skip audio/video detection
+        if (pkt->payload && pkt->payload->length() > 0) {
+            pkt->marker = false;
+            jitter_buffer->InsertPacket(pkt->sequence_number, pkt->timestamp, pkt->marker, 
+                    pkt->payload->bytes(), pkt->payload->length(), NULL);
+            ps_rtp_video_ts = pkt->timestamp;
+        }
         return;
     }
+
+    char *payload = pkt->payload->bytes();
 
     uint8_t p1 = (uint8_t)(payload[0]);
     uint8_t p2 = (uint8_t)(payload[1]);
@@ -2390,7 +2403,10 @@ SrsGb28181Conn::SrsGb28181Conn(SrsGb28181Caster* c, srs_netfd_t fd, SrsGb28181Ps
 
 SrsGb28181Conn::~SrsGb28181Conn()
 {
-	free(mbuffer);
+	if (mbuffer) {
+		free(mbuffer);
+		mbuffer = NULL;
+	}
 	srs_close_stfd(stfd);
 
 	srs_freep(trd);
@@ -2401,6 +2417,11 @@ SrsGb28181Conn::~SrsGb28181Conn()
 srs_error_t SrsGb28181Conn::serve()
 {
 	srs_error_t err = srs_success;
+
+	// Check if buffer allocation succeeded
+	if (!mbuffer) {
+		return srs_error_new(ERROR_SYSTEM_PACKET_INVALID, "failed to allocate buffer");
+	}
 
 	if ((err = skt->initialize(stfd)) != srs_success) {
 		return srs_error_wrap(err, "socket initialize");
@@ -2427,93 +2448,71 @@ srs_error_t SrsGb28181Conn::do_cycle()
     std::string ip = srs_get_peer_ip(fd);
     int port = srs_get_peer_port(fd);
     int addr_len = sizeof(sockaddr_in);
-    sockaddr_in *peer_sockaddr = (sockaddr_in*)malloc(addr_len);
-    peer_sockaddr->sin_family = AF_INET;  //设置地址家族
-    peer_sockaddr->sin_port = htons(port);  //设置端口
+    
+    // Use stack allocation to avoid memory leak on error paths
+    sockaddr_in peer_sockaddr_storage;
+    sockaddr_in *peer_sockaddr = &peer_sockaddr_storage;
+    memset(peer_sockaddr, 0, sizeof(sockaddr_in));
+    peer_sockaddr->sin_family = AF_INET;
+    peer_sockaddr->sin_port = htons(port);
     peer_sockaddr->sin_addr.s_addr = inet_addr(ip.c_str());
-
 
     if (ip.empty() && !_srs_config->empty_ip_ok()) {
         srs_warn("empty ip for fd=%d", srs_netfd_fileno(stfd));
     }
     srs_trace("gb28181 new connect by rtp-tcp from: %s:%d", ip.c_str(), port);
 
-    uint32_t left_data_len = 0; //缓存剩余数据
-    ssize_t nb_read = 0;
-    uint16_t  packet_len = 0; //rtp包长度
-
-    // consume all rtp data.
+    // consume all rtp data using RFC4571 framing
     while (true) {
         if ((err = trd->pull()) != srs_success) {
             return srs_error_wrap(err, "rtsp cycle");
         }
-        nb_read = 0;
-        if ((err = skt->read(mbuffer + left_data_len, SRS_RTSP_BUFFER - left_data_len, &nb_read)) != srs_success) {
-            return srs_error_wrap(err, "recv data");
-        }
 
-        left_data_len = nb_read + left_data_len;
-        char * buf = mbuffer;
-
-        uint32_t index = 0;
-        while (left_data_len - index >= RTP_TCP_HEADER) {
-            uint8_t magic = static_cast<uint8_t>(buf[index]);
-
-            if (magic == 0x24) {
-                if (left_data_len - index < 4) {
-                    break;
-                }
-
-                uint16_t interleaved_len = (static_cast<uint8_t>(buf[index + 2]) << 8) | static_cast<uint8_t>(buf[index + 3]);
-                if (interleaved_len == 0) {
-                    srs_warn("gb28181: ignore empty interleaved packet from %s", remote_ip().c_str());
-                    index += 4;
-                    continue;
-                }
-                if (interleaved_len > MAX_PACKAGE_SIZE) {
-                    srs_error("abnormal interleaved RTP packet length:%d, close the tcp conn:%s", interleaved_len, remote_ip().c_str());
-                    return err;
-                }
-                if (left_data_len - index < 4u + interleaved_len) {
-                    break;
-                }
-
-                processor->on_tcp_packet((sockaddr*)peer_sockaddr, addr_len, buf + index + 4, interleaved_len);
-                index += 4 + interleaved_len;
+        // RFC4571: Read 2 bytes length prefix
+        uint16_t length = 0;
+        if (true) {
+            uint8_t lbuffer[2];
+            if ((err = skt->read_fully(lbuffer, sizeof(lbuffer), NULL)) != srs_success) {
+                return srs_error_wrap(err, "read length");
+            }
+            
+            length = ((uint16_t)lbuffer[0]) << 8 | (uint16_t)lbuffer[1];
+            if (length == 0) {
+                srs_warn("gb28181: ignore empty length from %s", ip.c_str());
                 continue;
             }
-
-            if (left_data_len - index < RTP_TCP_HEADER) {
-                break;
-            }
-
-            packet_len = (static_cast<uint8_t>(buf[index]) << 8) | static_cast<uint8_t>(buf[index + 1]);
-            if (packet_len == 0) {
-                srs_warn("gb28181: ignore empty tcp rtp packet from %s", remote_ip().c_str());
-                index += RTP_TCP_HEADER;
-                continue;
-            }
-            if (packet_len > MAX_PACKAGE_SIZE) {
-                srs_error("abnormal RTP packet length:%d, close the tcp conn:%s", packet_len, remote_ip().c_str());
-                return err;
-            }
-            if (left_data_len - index < RTP_TCP_HEADER + packet_len) {
-                break;
-            }
-
-            processor->on_tcp_packet((sockaddr*)peer_sockaddr, addr_len, buf + index + RTP_TCP_HEADER, packet_len);
-            index += RTP_TCP_HEADER + packet_len;
+        }
+        
+        // Sanity check: Reject abnormally large packets
+        if (length > MAX_PACKAGE_SIZE) {
+            srs_error("gb28181: abnormal RTP packet length=%d from %s, closing connection", length, ip.c_str());
+            return srs_error_new(ERROR_GB28181_PACKET_INVALID, "invalid packet length=%d", length);
+        }
+        
+        // Check buffer capacity to prevent overflow
+        if (length > SRS_RTSP_BUFFER) {
+            srs_error("gb28181: packet length=%d exceeds buffer size=%d from %s", length, SRS_RTSP_BUFFER, ip.c_str());
+            return srs_error_new(ERROR_GB28181_PACKET_LENGTH, "packet exceeds buffer");
+        }
+        
+        // Log warning for large packets (typically RTP packets are under 1500 bytes)
+        if (length > 1500) {
+            srs_warn("gb28181: large RTP packet length=%d from %s", length, ip.c_str());
         }
 
-        if (index != 0) {
-            left_data_len -= index;
-            if (left_data_len > 0) {
-                memmove(mbuffer, buf + index, left_data_len);
-            }
+        // Read the full RTP packet payload
+        if ((err = skt->read_fully(mbuffer, length, NULL)) != srs_success) {
+            return srs_error_wrap(err, "read packet");
         }
 
+        // Process the complete RTP packet
+        if ((err = processor->on_tcp_packet((sockaddr*)peer_sockaddr, addr_len, mbuffer, length)) != srs_success) {
+            srs_warn("gb28181: process packet error %s, length=%d", 
+                     srs_error_desc(err).c_str(), length);
+            srs_freep(err); // Continue processing other packets
+        }
     }
-    free(peer_sockaddr);
+    
     return err;
 }
 
