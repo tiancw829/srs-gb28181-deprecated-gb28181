@@ -279,10 +279,21 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
     
     int peer_port = atoi(port_string);
 
-    // Validate buffer size
-    if (nb_buf < 12) { // Minimum RTP header size
+    // Validate buffer size - minimum RTP header is 12 bytes
+    if (nb_buf < 12) {
         srs_warn("gb28181 ps rtp: packet too small %d bytes, peer=%s:%d", nb_buf, address_string, peer_port);
         return srs_success;
+    }
+
+    // Drop RTCP packets (payload type 72-76 are reserved for RTCP)
+    // See RFC 3550 section 5.1
+    uint8_t* data = (uint8_t*)buf;
+    if (nb_buf >= 2) {
+        uint8_t pt = data[1] & 0x7f;
+        if (pt >= 72 && pt <= 76) {
+            srs_info("gb28181 ps rtp: drop RTCP packet, pt=%d, peer=%s:%d", pt, address_string, peer_port);
+            return srs_success;
+        }
     }
 
     SrsBuffer stream(buf, nb_buf);
@@ -444,6 +455,20 @@ int64_t  SrsPsStreamDemixer::parse_ps_timestamp(const uint8_t* p)
 srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_t timestamp, uint32_t ssrc)
 {
     srs_error_t err = srs_success;
+    
+    // Validate input parameters
+    if (!ps_data || ps_size <= 0) {
+        srs_warn("gb28181: PS stream data is null or empty, size=%d", ps_size);
+        return srs_success;
+    }
+    
+    // Minimum PS packet size check (at least start code + minimal header)
+    if (ps_size < (int)sizeof(SrsPsPacketStartCode)) {
+        srs_warn("gb28181: PS packet too small, size=%d, min=%d", 
+                 ps_size, (int)sizeof(SrsPsPacketStartCode));
+        return srs_success;
+    }
+    
     int complete_len = 0;
     int incomplete_len = ps_size;
     char *next_ps_pack = ps_data;
@@ -581,10 +606,19 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
             pse_index +=1;
 
             int packlength = htons(pse_pack->length);
-            int payloadlen = packlength - 2 - 1 - pse_pack->stuffing_length;
+            int stuffing_len = pse_pack->stuffing_length & 0x07;
+            int payloadlen = packlength - 2 - 1 - stuffing_len;
+            
+            // Validate payload length to prevent buffer overflow
+            int header_len = 9 + stuffing_len;
+            if (payloadlen < 0 || payloadlen > incomplete_len - header_len) {
+                srs_warn("gb28181: invalid video PES payload length=%d, incomplete_len=%d, header_len=%d",
+                         payloadlen, incomplete_len, header_len);
+                break;
+            }
          
-            next_ps_pack = next_ps_pack + 9 + pse_pack->stuffing_length;
-            complete_len = complete_len + 9 + pse_pack->stuffing_length;
+            next_ps_pack = next_ps_pack + 9 + stuffing_len;
+            complete_len = complete_len + 9 + stuffing_len;
 
             video_stream.append(next_ps_pack, payloadlen);
 
@@ -634,8 +668,18 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
          	}
 
 			int packlength = htons(pse_pack->length);
-			int payload_len = packlength - 2 - 1 - pse_pack->stuffing_length;
-            next_ps_pack = next_ps_pack + 9 + pse_pack->stuffing_length;
+			int stuffing_len = pse_pack->stuffing_length & 0x07;
+			int payload_len = packlength - 2 - 1 - stuffing_len;
+            
+            // Validate payload length to prevent buffer overflow
+            int header_len = 9 + stuffing_len;
+            if (payload_len < 0 || payload_len > incomplete_len - header_len) {
+                srs_warn("gb28181: invalid audio PES payload length=%d, incomplete_len=%d, header_len=%d",
+                         payload_len, incomplete_len, header_len);
+                break;
+            }
+            
+            next_ps_pack = next_ps_pack + 9 + stuffing_len;
 
             //if ps map is not aac, but stream  many be aac adts , try update type, 
             //TODO: dahua audio ps map type always is 0x90(g711)
@@ -677,7 +721,7 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 #endif
             
 			next_ps_pack = next_ps_pack + payload_len;
-            complete_len = complete_len + (payload_len + 9 + pse_pack->stuffing_length);
+            complete_len = complete_len + (payload_len + 9 + stuffing_len);
             incomplete_len = ps_size - complete_len;
 
             if (hander && audio_enable && audio_stream.length() && can_send_ps_av_packet()) {
@@ -820,6 +864,7 @@ SrsGb28181RtmpMuxer::SrsGb28181RtmpMuxer(SrsGb28181Manger* c, std::string id, bo
     source = NULL;
     source_publish = true;
     warned_no_sps_pps = false;
+    recovery_attempts = 0;
 
     jitter_buffer = new SrsRtpJitterBuffer(id);
     jitter_buffer_audio = new SrsRtpJitterBuffer(id);
@@ -1066,24 +1111,37 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
 
         if (decoded_any) {
             last_decoded_time = srs_get_system_time();
+            recovery_attempts = 0; // Reset recovery counter on successful decode
         } else {
             srs_utime_t now = srs_get_system_time();
-            // If we are receiving data (recv_rtp_stream_time is recent) but not decoding for 5 seconds,
-            // it means the jitter buffer might be stuck (e.g. waiting for a missing packet that will never arrive).
-            // We flush it to force recovery.
-            if (now - recv_rtp_stream_time < 2 * SRS_UTIME_SECONDS && now - last_decoded_time > 5 * SRS_UTIME_SECONDS) {
-                 srs_warn("gb28181: jitter buffer stuck (receiving but not decoding), flushing to recover...");
-                 jitter_buffer->Flush();
-                 jitter_buffer_audio->Flush();
-                 last_decoded_time = now;
+            // Progressive recovery strategy:
+            // If receiving data but not decoding for 2 seconds, the jitter buffer might be stuck.
+            // Use 2s threshold to stay within 5s latency requirement.
+            srs_utime_t stuck_threshold = 2 * SRS_UTIME_SECONDS;
+            if (now - recv_rtp_stream_time < 2 * SRS_UTIME_SECONDS && now - last_decoded_time > stuck_threshold) {
+                recovery_attempts++;
+                if (recovery_attempts <= 3) {
+                    srs_warn("gb28181: jitter buffer stuck (attempt %d), flushing to recover... client_id=%s, ssrc=%#x",
+                             recovery_attempts, channel_id.c_str(), channel->get_ssrc());
+                    jitter_buffer->Flush();
+                    jitter_buffer_audio->Flush();
+                    last_decoded_time = now;
+                } else {
+                    // After 3 failed recovery attempts, log error and reset state
+                    srs_error("gb28181: jitter buffer recovery failed after %d attempts, client_id=%s",
+                              recovery_attempts, channel_id.c_str());
+                    recovery_attempts = 0;
+                    last_decoded_time = now;
+                }
             }
         }
 
         if (pprint->can_print()) {
-            srs_trace("gb28181: client id=%s,  ssrc=%#x, peer(%s, %d), rtmp muxer is alive",
-                channel_id.c_str(),  channel->get_ssrc(), 
+            srs_trace("gb28181: client id=%s, ssrc=%#x, peer(%s, %d), rtmp muxer alive, recovery_attempts=%d",
+                channel_id.c_str(), channel->get_ssrc(), 
                 channel->get_rtp_peer_ip().c_str(),
-                channel->get_rtp_peer_port());
+                channel->get_rtp_peer_port(),
+                recovery_attempts);
         }
         
         srs_utime_t now = srs_get_system_time();
