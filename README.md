@@ -13,6 +13,9 @@ sudo make
 
 sudo vim ./conf/push.gb28181.conf
 
+chmod +x ./etc/init.d/srs
+sudo ./objs/srs -c ./conf/push.gb28181.conf
+
 ```
 # push gb28181 stream to SRS.
 
