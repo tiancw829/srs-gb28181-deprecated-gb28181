@@ -268,6 +268,9 @@
 #define ERROR_INOTIFY_OPENFD                3094
 #define ERROR_INOTIFY_WATCH                 3095
 #define ERROR_HTTP_URL_UNESCAPE             3096
+#define ERROR_HEVC_API_NO_PREFIXED          3097
+#define ERROR_HEVC_DECODE_ERROR             3098
+#define ERROR_HEVC_DROP_BEFORE_VPS_SPS_PPS  3099
 
 ///////////////////////////////////////////////////////
 // HTTP/StreamCaster protocol error.

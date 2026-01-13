@@ -63,6 +63,7 @@ class SrsConfDirective;
 class SrsRtspPacket;
 class SrsRtmpClient;
 class SrsRawH264Stream;
+class SrsRawHEVCStream;
 class SrsRawAacStream;
 struct SrsRawAacStreamCodec;
 class SrsSharedPtrMessage;
@@ -171,7 +172,7 @@ public:
     ISrsPsStreamHander();
     virtual ~ISrsPsStreamHander();
 public:
-    virtual srs_error_t on_rtp_video(SrsSimpleStream* stream, int64_t dts)=0;
+    virtual srs_error_t on_rtp_video(SrsSimpleStream* stream, int64_t dts, int video_type)=0;
     virtual srs_error_t on_rtp_audio(SrsSimpleStream* stream, int64_t dts, int type)=0;
 };
 
@@ -278,6 +279,14 @@ private:
     std::string h264_sps;
     std::string h264_pps;
 
+    // HEVC/H.265 support
+    SrsRawHEVCStream* hevc;
+    std::string h265_vps;
+    std::string h265_sps;
+    std::string h265_pps;
+    bool hevc_vps_sps_pps_changed;
+    bool hevc_vps_sps_pps_sent;
+
     SrsRawAacStream* aac;
     std::string aac_specific_config;
 
@@ -343,7 +352,7 @@ public:
     virtual const SrsContextId& get_id();
     virtual std::string desc();
 public:
-    virtual srs_error_t on_rtp_video(SrsSimpleStream* stream, int64_t dts);
+    virtual srs_error_t on_rtp_video(SrsSimpleStream* stream, int64_t dts, int video_type);
     virtual srs_error_t on_rtp_audio(SrsSimpleStream* stream, int64_t dts, int type);
 private:
     
@@ -351,6 +360,11 @@ private:
     srs_error_t write_h264_ipb_frame2(char *frame, int frame_size, uint32_t pts, uint32_t dts);
     virtual srs_error_t write_h264_sps_pps(uint32_t dts, uint32_t pts);
     virtual srs_error_t write_h264_ipb_frame(char* frame, int frame_size, uint32_t dts, uint32_t pts, bool b = true);
+    // HEVC/H.265 support
+    srs_error_t replace_startcode_with_nalulen_hevc(char *video_data, int &size, uint32_t pts, uint32_t dts);
+    srs_error_t write_h265_ipb_frame2(char *frame, int frame_size, uint32_t pts, uint32_t dts);
+    virtual srs_error_t write_h265_vps_sps_pps(uint32_t dts, uint32_t pts);
+    virtual srs_error_t write_h265_ipb_frame(char* frame, int frame_size, uint32_t dts, uint32_t pts);
     virtual srs_error_t write_audio_raw_frame(char* frame, int frame_size, SrsRawAacStreamCodec* codec, uint32_t dts);
     virtual srs_error_t rtmp_write_packet(char type, uint32_t timestamp, char* data, int size);
     virtual srs_error_t rtmp_write_packet_by_source(char type, uint32_t timestamp, char* data, int size);

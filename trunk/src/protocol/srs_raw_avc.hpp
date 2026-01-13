@@ -98,4 +98,42 @@ public:
     virtual srs_error_t mux_aac2flv(char* frame, int nb_frame, SrsRawAacStreamCodec* codec, uint32_t dts, char** flv, int* nb_flv);
 };
 
+// The raw h.265/HEVC stream, in annexb.
+class SrsRawHEVCStream
+{
+public:
+    SrsRawHEVCStream();
+    virtual ~SrsRawHEVCStream();
+public:
+    // Demux the stream in annexb format.
+    // @param stream the input stream bytes.
+    // @param pframe the output hevc frame in stream. user should never free it.
+    // @param pnb_frame the output hevc frame size.
+    virtual srs_error_t annexb_demux(SrsBuffer* stream, char** pframe, int* pnb_frame);
+    // whether the frame is vps, sps or pps.
+    virtual bool is_vps(char* frame, int nb_frame);
+    virtual bool is_sps(char* frame, int nb_frame);
+    virtual bool is_pps(char* frame, int nb_frame);
+    // Demux the vps, sps or pps to string.
+    virtual srs_error_t vps_demux(char* frame, int nb_frame, std::string& vps);
+    virtual srs_error_t sps_demux(char* frame, int nb_frame, std::string& sps);
+    virtual srs_error_t pps_demux(char* frame, int nb_frame, std::string& pps);
+public:
+    // The hevc raw data to hevc packet, without flv payload header.
+    // Mux the vps/sps/pps to flv sequence header packet.
+    // @param sh output the sequence header.
+    virtual srs_error_t mux_sequence_header(std::string vps, std::string sps, std::string pps, std::string& sh);
+    // The hevc raw data to hevc packet, without flv payload header.
+    // Mux the ibp to flv ibp packet.
+    // @param ibp output the packet.
+    virtual srs_error_t mux_ipb_frame(char* frame, int nb_frame, std::string& ibp);
+    // Mux the hevc video packet to flv video packet.
+    // @param frame_type, SrsVideoAvcFrameTypeKeyFrame or SrsVideoAvcFrameTypeInterFrame.
+    // @param avc_packet_type, SrsVideoAvcFrameTraitSequenceHeader or SrsVideoAvcFrameTraitNALU.
+    // @param video the hevc raw data.
+    // @param flv output the muxed flv packet.
+    // @param nb_flv output the muxed flv size.
+    virtual srs_error_t mux_hevc2flv(std::string video, int8_t frame_type, int8_t avc_packet_type, uint32_t dts, uint32_t pts, char** flv, int* nb_flv);
+};
+
 #endif

@@ -386,6 +386,67 @@ enum SrsAvcNaluType
 };
 std::string srs_avc_nalu2str(SrsAvcNaluType nalu_type);
 
+// HEVC NALU header size (2 bytes)
+const int SrsHevcNaluHeaderSize = 2;
+
+/**
+ * The enum NALU type for HEVC
+ * @see Table 7-1 – NAL unit type codes and NAL unit type classes
+ * @doc ITU-T-H.265-2021.pdf, page 86.
+ */
+enum SrsHevcNaluType {
+    SrsHevcNaluType_CODED_SLICE_TRAIL_N = 0,
+    SrsHevcNaluType_CODED_SLICE_TRAIL_R, // 1
+    SrsHevcNaluType_CODED_SLICE_TSA_N,   // 2
+    SrsHevcNaluType_CODED_SLICE_TLA,     // 3
+    SrsHevcNaluType_CODED_SLICE_STSA_N,  // 4
+    SrsHevcNaluType_CODED_SLICE_STSA_R,  // 5
+    SrsHevcNaluType_CODED_SLICE_RADL_N,  // 6
+    SrsHevcNaluType_CODED_SLICE_DLP,     // 7
+    SrsHevcNaluType_CODED_SLICE_RASL_N,  // 8
+    SrsHevcNaluType_CODED_SLICE_TFD,     // 9
+    SrsHevcNaluType_RESERVED_10,
+    SrsHevcNaluType_RESERVED_11,
+    SrsHevcNaluType_RESERVED_12,
+    SrsHevcNaluType_RESERVED_13,
+    SrsHevcNaluType_RESERVED_14,
+    SrsHevcNaluType_RESERVED_15,
+    SrsHevcNaluType_CODED_SLICE_BLA,      // 16
+    SrsHevcNaluType_CODED_SLICE_BLANT,    // 17
+    SrsHevcNaluType_CODED_SLICE_BLA_N_LP, // 18
+    SrsHevcNaluType_CODED_SLICE_IDR,      // 19
+    SrsHevcNaluType_CODED_SLICE_IDR_N_LP, // 20
+    SrsHevcNaluType_CODED_SLICE_CRA,      // 21
+    SrsHevcNaluType_RESERVED_22,
+    SrsHevcNaluType_RESERVED_23,
+    SrsHevcNaluType_RESERVED_24,
+    SrsHevcNaluType_RESERVED_25,
+    SrsHevcNaluType_RESERVED_26,
+    SrsHevcNaluType_RESERVED_27,
+    SrsHevcNaluType_RESERVED_28,
+    SrsHevcNaluType_RESERVED_29,
+    SrsHevcNaluType_RESERVED_30,
+    SrsHevcNaluType_RESERVED_31,
+    SrsHevcNaluType_VPS,                   // 32
+    SrsHevcNaluType_SPS,                   // 33
+    SrsHevcNaluType_PPS,                   // 34
+    SrsHevcNaluType_ACCESS_UNIT_DELIMITER, // 35
+    SrsHevcNaluType_EOS,                   // 36
+    SrsHevcNaluType_EOB,                   // 37
+    SrsHevcNaluType_FILLER_DATA,           // 38
+    SrsHevcNaluType_SEI,                   // 39 Prefix SEI
+    SrsHevcNaluType_SEI_SUFFIX,            // 40 Suffix SEI
+    SrsHevcNaluType_INVALID,
+};
+
+// Parse HEVC NALU type from NAL header byte
+// @see https://datatracker.ietf.org/doc/html/rfc7798#section-1.1.4
+#define SrsHevcNaluTypeParse(code) (SrsHevcNaluType)(((code) & 0x7E) >> 1)
+
+// Check if NALU type is IRAP (Intra Random Access Point)
+// IRAP includes BLA, IDR, and CRA frames
+#define SrsIsIRAP(type) ((type >= SrsHevcNaluType_CODED_SLICE_BLA) && (type <= SrsHevcNaluType_RESERVED_23))
+
 /**
  * Table 7-6 – Name association to slice_type
  * ISO_IEC_14496-10-AVC-2012.pdf, page 105.
