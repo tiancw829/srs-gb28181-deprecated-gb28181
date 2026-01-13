@@ -606,9 +606,9 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
             pse_index +=1;
 
             int packlength = htons(pse_pack->length);
-            int stuffing_len = pse_pack->stuffing_length & 0x07;
+            int stuffing_len = pse_pack->stuffing_length;
             int payloadlen = packlength - 2 - 1 - stuffing_len;
-            
+
             // Validate payload length to prevent buffer overflow
             int header_len = 9 + stuffing_len;
             if (payloadlen < 0 || payloadlen > incomplete_len - header_len) {
@@ -668,7 +668,7 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
          	}
 
 			int packlength = htons(pse_pack->length);
-			int stuffing_len = pse_pack->stuffing_length & 0x07;
+			int stuffing_len = pse_pack->stuffing_length;
 			int payload_len = packlength - 2 - 1 - stuffing_len;
             
             // Validate payload length to prevent buffer overflow
@@ -1115,9 +1115,8 @@ srs_error_t SrsGb28181RtmpMuxer::do_cycle()
         } else {
             srs_utime_t now = srs_get_system_time();
             // Progressive recovery strategy:
-            // If receiving data but not decoding for 2 seconds, the jitter buffer might be stuck.
-            // Use 2s threshold to stay within 5s latency requirement.
-            srs_utime_t stuck_threshold = 2 * SRS_UTIME_SECONDS;
+            // If receiving data but not decoding for 5 seconds, the jitter buffer might be stuck.
+            srs_utime_t stuck_threshold = 5 * SRS_UTIME_SECONDS;
             if (now - recv_rtp_stream_time < 2 * SRS_UTIME_SECONDS && now - last_decoded_time > stuck_threshold) {
                 recovery_attempts++;
                 if (recovery_attempts <= 3) {
