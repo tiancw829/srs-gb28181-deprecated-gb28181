@@ -192,6 +192,9 @@ public:
 private:
     virtual SrsStatisticVhost* create_vhost(SrsRequest* req);
     virtual SrsStatisticStream* create_stream(SrsStatisticVhost* vhost, SrsRequest* req);
+    // Cleanup stream if it's inactive and has no clients.
+    // @see https://github.com/ossrs/srs/issues/803
+    virtual void cleanup_stream(SrsStatisticStream* stream);
 };
 
 #endif
