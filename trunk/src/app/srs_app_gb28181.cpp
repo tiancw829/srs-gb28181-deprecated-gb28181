@@ -2387,9 +2387,14 @@ srs_error_t SrsGb28181Manger::query_device_list(std::string id, SrsJsonArray* ar
 
     return sip_service->query_device_list(id, arr);
 }
-#define SRS_RTSP_BUFFER 8192
+// Buffer size for GB28181 TCP RTP packets. Use 65535 to support large packets like I-frames.
+// Reference: https://github.com/ossrs/srs/issues/xxxx
+#define SRS_RTSP_BUFFER 65535
 #define RTP_TCP_HEADER 2
-#define MAX_PACKAGE_SIZE 1024 * 10
+// Warn threshold for large packets. Typical RTP packets are under 1500 bytes,
+// but PS encapsulated I-frames may reach 8-10KB, which is normal for high-resolution video.
+// Only warn if packet exceeds 10KB to avoid log flooding.
+#define SRS_GB_LARGE_PACKET 10240
 SrsGb28181Conn::SrsGb28181Conn(SrsGb28181Caster* c, srs_netfd_t fd, SrsGb28181PsRtpProcessor *rtp_processor)
 {
 	caster = c;
@@ -2483,20 +2488,14 @@ srs_error_t SrsGb28181Conn::do_cycle()
             }
         }
         
-        // Sanity check: Reject abnormally large packets
-        if (length > MAX_PACKAGE_SIZE) {
-            srs_error("gb28181: abnormal RTP packet length=%d from %s, closing connection", length, ip.c_str());
-            return srs_error_new(ERROR_GB28181_PACKET_INVALID, "invalid packet length=%d", length);
-        }
-        
         // Check buffer capacity to prevent overflow
         if (length > SRS_RTSP_BUFFER) {
             srs_error("gb28181: packet length=%d exceeds buffer size=%d from %s", length, SRS_RTSP_BUFFER, ip.c_str());
             return srs_error_new(ERROR_GB28181_PACKET_LENGTH, "packet exceeds buffer");
         }
         
-        // Log warning for large packets (typically RTP packets are under 1500 bytes)
-        if (length > 1500) {
+        // Warn for large packets (typically RTP packets are under 1500 bytes, but large I-frames can exceed)
+        if (length > SRS_GB_LARGE_PACKET) {
             srs_warn("gb28181: large RTP packet length=%d from %s", length, ip.c_str());
         }
 
