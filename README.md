@@ -12,6 +12,7 @@ sudo ./configure --gb28181=on
 sudo make
 
 sudo vim ./conf/push.gb28181.conf
+修改candidate为流服务器地址
 
 chmod +x ./etc/init.d/srs
 sudo ./objs/srs -c ./conf/push.gb28181.conf

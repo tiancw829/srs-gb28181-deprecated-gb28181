@@ -144,14 +144,28 @@ function Centos_prepare()
 {
     # Check for standard CentOS/RHEL
     if [[ ! -f /etc/redhat-release ]]; then
-        # Check for KylinOS which is based on CentOS
-        if [[ ! -f /etc/kylin-release ]]; then
-            return 0;
+        # Check for openEuler/EulerOS by release files.
+        if [[ -f /etc/openEuler-release || -f /etc/euleros-release ]]; then
+            OS_IS_CENTOS=YES
+        elif [[ -f /etc/os-release ]]; then
+            # Check for openEuler/EulerOS by os-release.
+            grep -Ei "^(ID|ID_LIKE)=.*(openEuler|euleros|rhel|centos|fedora)" /etc/os-release >/dev/null 2>&1
+            ret=$?; if [[ 0 -eq $ret ]]; then
+                OS_IS_CENTOS=YES
+            fi
         fi
-        # Check if it's KylinOS
-        grep -i "Kylin" /etc/kylin-release >/dev/null 2>&1
-        ret=$?; if [[ 0 -ne $ret ]]; then
+
+        if [[ $OS_IS_CENTOS = YES ]]; then
+            :
+        # Check for KylinOS which is based on CentOS
+        elif [[ ! -f /etc/kylin-release ]]; then
             return 0;
+        else
+            # Check if it's KylinOS
+            grep -i "Kylin" /etc/kylin-release >/dev/null 2>&1
+            ret=$?; if [[ 0 -ne $ret ]]; then
+                return 0;
+            fi
         fi
     fi
 
