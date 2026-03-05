@@ -3250,6 +3250,8 @@ VOID TEST(KernelCodecTest, CoverAll)
         EXPECT_TRUE(!v.acceptable((char*)"\x10", 1));
         EXPECT_TRUE(!v.acceptable((char*)"\x1f", 1));
         EXPECT_TRUE(v.acceptable((char*)"\x13", 1));
+        EXPECT_TRUE(v.acceptable((char*)"\x1c", 1));
+        EXPECT_TRUE(!v.acceptable((char*)"\x1d", 1));
     }
     
     if (true) {

@@ -154,7 +154,7 @@ bool SrsFlvVideo::acceptable(char* data, int size)
         return false;
     }
     
-    if (codec_id < 2 || codec_id > 7) {
+    if (codec_id < 2 || (codec_id > 7 && codec_id != SrsVideoCodecIdHEVC)) {
         return false;
     }
     

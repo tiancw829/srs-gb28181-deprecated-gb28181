@@ -559,7 +559,7 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
     int complete_len = 0;
     int incomplete_len = ps_size;
     char *next_ps_pack = ps_data;
-    const int max_recover = 8;
+    const int max_recover = 16;
 
     SrsSimpleStream video_stream;
     SrsSimpleStream audio_stream;
@@ -887,36 +887,39 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
             }
             unknow_fw.write(next_ps_pack,  incomplete_len, NULL);          
 #endif      
-            //TODO: fixme unkonw ps data parse
+            // Reset keyframe gate immediately when encountering unknown PS bytes.
+            // Even if we can resync later, we should wait for next keyframe for safety.
+            first_keyframe_flag = false;
+
+            srs_trace("gb28181: client_id %s, unknown ps data (%#x/%u) %02x %02x %02x %02x, incomplete=%d", 
+                channel_id.c_str(), ssrc, timestamp,  
+                next_ps_pack[0]&0xFF, next_ps_pack[1]&0xFF, next_ps_pack[2]&0xFF, next_ps_pack[3]&0xFF,
+                incomplete_len);
+
+            // Compatibility fallback for some devices (for example some Dahua streams)
+            // where PS header may be lost and payload starts with 00 00 00 01.
             if (next_ps_pack
-            && next_ps_pack[0] == (char)0x00
-			&& next_ps_pack[1] == (char)0x00
-			&& next_ps_pack[2] == (char)0x00
-			&& next_ps_pack[3] == (char)0x01){
-                //dahua's PS header may lose packets. It is sent by an RTP packet of Dahua's PS header
-                //dahua rtp send format:
-                //ts=1000 seq=1 mark=false payload= ps header
-                //ts=1000 seq=2 mark=false payload= video
-                //ts=1000 seq=3 mark=true payload= video
-                //ts=1000 seq=4 mark=true payload= audio
-                incomplete_len = ps_size - complete_len; 
+                && next_ps_pack[0] == (char)0x00
+                && next_ps_pack[1] == (char)0x00
+                && next_ps_pack[2] == (char)0x00
+                && next_ps_pack[3] == (char)0x01) {
+                incomplete_len = ps_size - complete_len;
                 complete_len = complete_len + incomplete_len;
             }
 
-            first_keyframe_flag = false;
-            srs_trace("gb28181: client_id %s, unkonw ps data (%#x/%u) %02x %02x %02x %02x\n", 
-                channel_id.c_str(), ssrc, timestamp,  
-                next_ps_pack[0]&0xFF, next_ps_pack[1]&0xFF, next_ps_pack[2]&0xFF, next_ps_pack[3]&0xFF);
-
+            // Try to find the next valid PS pack header (00 00 01 BA) to recover
             int skip = srs_gb_find_next_ps_pack(next_ps_pack, incomplete_len);
             if (skip > 0 && ps_recover_count < max_recover) {
                 ps_recover_count++;
+                srs_trace("gb28181: client_id %s, skip %d unknown bytes to next PS pack, recover=%d/%d",
+                         channel_id.c_str(), skip, ps_recover_count, max_recover);
                 complete_len += skip;
                 next_ps_pack += skip;
                 incomplete_len = ps_size - complete_len;
                 continue;
             }
 
+            // No pack header found or max recovery exceeded, skip all remaining data
             break;
         }
     }
@@ -2829,7 +2832,8 @@ srs_error_t SrsGb28181Manger::query_device_list(std::string id, SrsJsonArray* ar
 }
 // Buffer size for GB28181 TCP RTP packets. Use 65535 to support large packets like I-frames.
 // Reference: https://github.com/ossrs/srs/issues/xxxx
-#define SRS_RTSP_BUFFER 65535
+// RFC4571 max frame size = uint16_t max = 65535
+#define SRS_GB_TCP_BUFFER 65535
 #define RTP_TCP_HEADER 2
 // Warn threshold for large packets. Typical RTP packets are under 1500 bytes,
 // but PS encapsulated I-frames may reach 8-10KB, which is normal for high-resolution video.
@@ -2841,8 +2845,8 @@ SrsGb28181Conn::SrsGb28181Conn(SrsGb28181Caster* c, srs_netfd_t fd, SrsGb28181Ps
 	stfd = fd;
 	skt = new SrsStSocket();
 	rtsp = new SrsRtspStack(skt);
-	trd = new SrsSTCoroutine("rtsp", this);
-	mbuffer = (char*)malloc(SRS_RTSP_BUFFER);
+	trd = new SrsSTCoroutine("gb28181tcp", this);
+	mbuffer = (char*)malloc(SRS_GB_TCP_BUFFER);
 	processor = rtp_processor;
 }
 
@@ -2873,7 +2877,7 @@ srs_error_t SrsGb28181Conn::serve()
 	}
 
 	if ((err = trd->start()) != srs_success) {
-		return srs_error_wrap(err, "rtsp connection");
+		return srs_error_wrap(err, "gb28181 tcp connection");
 	}
 	return err;
 }
@@ -2910,7 +2914,7 @@ srs_error_t SrsGb28181Conn::do_cycle()
     // consume all rtp data using RFC4571 framing
     while (true) {
         if ((err = trd->pull()) != srs_success) {
-            return srs_error_wrap(err, "rtsp cycle");
+            return srs_error_wrap(err, "gb28181 tcp cycle");
         }
 
         // RFC4571: Read 2 bytes length prefix
@@ -2928,9 +2932,11 @@ srs_error_t SrsGb28181Conn::do_cycle()
             }
         }
         
-        // Check buffer capacity to prevent overflow
-        if (length > SRS_RTSP_BUFFER) {
-            srs_error("gb28181: packet length=%d exceeds buffer size=%d from %s", length, SRS_RTSP_BUFFER, ip.c_str());
+        // Check buffer capacity to prevent overflow.
+        // Keep fail-fast behavior for abnormal packets to avoid silent stream corruption.
+        if (length > SRS_GB_TCP_BUFFER) {
+            srs_error("gb28181: packet length=%d exceeds buffer size=%d from %s",
+                      length, SRS_GB_TCP_BUFFER, ip.c_str());
             return srs_error_new(ERROR_GB28181_PACKET_LENGTH, "packet exceeds buffer");
         }
         
@@ -2957,7 +2963,7 @@ srs_error_t SrsGb28181Conn::do_cycle()
 
 srs_error_t SrsGb28181Conn::cycle()
 {
-	// serve the rtsp client.
+	// serve the gb28181 tcp client.
 	srs_error_t err = do_cycle();
 
 	caster->remove(this);
