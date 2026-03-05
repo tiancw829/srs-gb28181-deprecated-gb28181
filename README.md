@@ -17,6 +17,10 @@ sudo vim ./conf/push.gb28181.conf
 chmod +x ./etc/init.d/srs
 sudo ./objs/srs -c ./conf/push.gb28181.conf
 
+查看状态和停止
+sudo ./etc/init.d/srs status
+sudo ./etc/init.d/srs stop
+
 ```
 # push gb28181 stream to SRS.
 

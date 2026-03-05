@@ -144,6 +144,8 @@ private:
     SrsGb28181Config* config;
     std::map<std::string, SrsPsRtpPacket*> cache_ps_rtp_packet;
     std::map<std::string, SrsPsRtpPacket*> pre_packet;
+    std::map<uint32_t, uint16_t> last_rtp_seq_by_ssrc;
+    std::map<uint32_t, int> rtp_recover_count_by_ssrc;
     std::string channel_id;
     bool auto_create_channel;
 public:
@@ -233,6 +235,7 @@ private:
     uint8_t audio_es_id;
     uint8_t audio_es_type;
     int audio_check_aac_try_count;
+    int ps_recover_count;
     
     SrsRawAacStream *aac;
 
@@ -338,6 +341,7 @@ public:
     srs_utime_t get_recv_stream_time();
 
     void insert_jitterbuffer(SrsPsRtpPacket *pkt);
+    void jitterbuffer_recover_from_rtp_gap(uint32_t ssrc, int gap, const std::string& peer_ip, int peer_port);
 
 private:
     virtual srs_error_t do_cycle();

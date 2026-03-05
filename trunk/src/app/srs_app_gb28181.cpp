@@ -35,6 +35,7 @@ using namespace std;
 #include <srs_protocol_format.hpp>
 #include <srs_app_gb28181_stack.hpp>
 #include <srs_app_rtc_source.hpp>
+#include <srs_kernel_rtc_rtp.hpp>
 
 //#define W_PS_FILE
 //#define W_VIDEO_FILE
@@ -164,6 +165,8 @@ void SrsGb28181PsRtpProcessor::dispose()
         srs_freep(it2->second);
     }
     cache_ps_rtp_packet.clear();
+    last_rtp_seq_by_ssrc.clear();
+    rtp_recover_count_by_ssrc.clear();
 
     clear_pre_packet();
 
@@ -291,7 +294,7 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
     if (nb_buf >= 2) {
         uint8_t pt = data[1] & 0x7f;
         if (pt >= 72 && pt <= 76) {
-            srs_info("gb28181 ps rtp: drop RTCP packet, pt=%d, peer=%s:%d", pt, address_string, peer_port);
+            srs_trace("gb28181 ps rtp: drop RTCP packet, pt=%d, peer=%s:%d", pt, address_string, peer_port);
             return srs_success;
         }
     }
@@ -307,10 +310,6 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
         return srs_success; // pkt will be freed by SrsAutoFree
     }
     
-    std::stringstream ss3;
-    ss3 << pkt->ssrc << ":" << port_string;
-    std::string jitter_key = ss3.str();
-    
     pkt->completed = pkt->marker;
     
     if (pprint->can_print()) {
@@ -320,9 +319,80 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
                     pkt->payload->length()
                     );
     }
+
+    bool drop_packet = false;
+    bool need_recover = false;
+    int gap = 0;
+    static const int kMaxRtpRecover = 16;
+    static const int kMaxRtpReorder = 128;
+
+    map<uint32_t, uint16_t>::iterator it_seq = last_rtp_seq_by_ssrc.find(pkt->ssrc);
+    if (it_seq == last_rtp_seq_by_ssrc.end()) {
+        last_rtp_seq_by_ssrc[pkt->ssrc] = pkt->sequence_number;
+        rtp_recover_count_by_ssrc[pkt->ssrc] = 0;
+    } else {
+        uint16_t last_seq = it_seq->second;
+        int32_t delta = srs_seq_distance(pkt->sequence_number, last_seq);
+
+        if (delta == 0) {
+            // Duplicate packet, drop to avoid disturbing jitter state.
+            drop_packet = true;
+            if (pprint->can_print()) {
+                srs_trace("gb28181 ps rtp: drop duplicate packet, client_id=%s, ssrc=%#x, seq=%u, last=%u, peer=%s:%d",
+                    channel_id.c_str(), pkt->ssrc, pkt->sequence_number, last_seq, address_string, peer_port);
+            }
+        } else if (delta > 1) {
+            gap = (int)delta - 1;
+            int& recover_count = rtp_recover_count_by_ssrc[pkt->ssrc];
+            recover_count++;
+
+            if (recover_count <= kMaxRtpRecover) {
+                need_recover = true;
+                srs_warn("gb28181 ps rtp: seq gap=%d, recover=%d/%d, client_id=%s, ssrc=%#x, last=%u, cur=%u, peer=%s:%d",
+                    gap, recover_count, kMaxRtpRecover, channel_id.c_str(), pkt->ssrc,
+                    last_seq, pkt->sequence_number, address_string, peer_port);
+            } else {
+                if (recover_count == kMaxRtpRecover + 1) {
+                    srs_warn("gb28181 ps rtp: too many seq gaps, stop active recover, client_id=%s, ssrc=%#x, peer=%s:%d",
+                        channel_id.c_str(), pkt->ssrc, address_string, peer_port);
+                }
+            }
+
+            it_seq->second = pkt->sequence_number;
+        } else if (delta < 0) {
+            int backward = -delta;
+            if (backward <= kMaxRtpReorder) {
+                // Slight rollback is treated as out-of-order old packet.
+                drop_packet = true;
+                if (pprint->can_print()) {
+                    srs_trace("gb28181 ps rtp: drop old packet, client_id=%s, ssrc=%#x, seq=%u, last=%u, rollback=%d, peer=%s:%d",
+                        channel_id.c_str(), pkt->ssrc, pkt->sequence_number, last_seq,
+                        backward, address_string, peer_port);
+                }
+            } else {
+                // Large rollback usually means sender restarted/reset sequence.
+                srs_warn("gb28181 ps rtp: reset sequence window, client_id=%s, ssrc=%#x, seq=%u, last=%u, rollback=%d, peer=%s:%d",
+                    channel_id.c_str(), pkt->ssrc, pkt->sequence_number, last_seq,
+                    backward, address_string, peer_port);
+                rtp_recover_count_by_ssrc[pkt->ssrc] = 0;
+                it_seq->second = pkt->sequence_number;
+            }
+        } else {
+            // Continuous sequence, reset recover counter.
+            rtp_recover_count_by_ssrc[pkt->ssrc] = 0;
+            it_seq->second = pkt->sequence_number;
+        }
+    }
+
+    if (drop_packet) {
+        return srs_success;
+    }
   
     SrsGb28181RtmpMuxer *muxer = fetch_rtmpmuxer(channel_id, pkt->ssrc);
     if (muxer){
+        // if (need_recover) {
+        //     muxer->jitterbuffer_recover_from_rtp_gap(pkt->ssrc, gap, address_string, peer_port);
+        // }
         rtmpmuxer_enqueue_data(muxer, pkt->ssrc, peer_port, address_string, pkt);
     }
     // pkt will be automatically freed by SrsAutoFree when function returns
@@ -354,6 +424,7 @@ SrsPsStreamDemixer::SrsPsStreamDemixer(ISrsPsStreamHander *h, std::string id, bo
     audio_es_id = 0;
     audio_es_type = 0;
     audio_check_aac_try_count = 0;
+    ps_recover_count = 0;
 
     aac = new SrsRawAacStream();
 }
@@ -452,6 +523,22 @@ int64_t  SrsPsStreamDemixer::parse_ps_timestamp(const uint8_t* p)
 	return val;
 }
 
+static int srs_gb_find_next_ps_pack(char* p, int left)
+{
+    if (!p || left < 4) {
+        return -1;
+    }
+
+    for (int i = 1; i + 3 < left; ++i) {
+        if ((uint8_t)p[i] == 0x00 && (uint8_t)p[i + 1] == 0x00 &&
+            (uint8_t)p[i + 2] == 0x01 && (uint8_t)p[i + 3] == 0xBA) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_t timestamp, uint32_t ssrc)
 {
     srs_error_t err = srs_success;
@@ -472,6 +559,7 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
     int complete_len = 0;
     int incomplete_len = ps_size;
     char *next_ps_pack = ps_data;
+    const int max_recover = 8;
 
     SrsSimpleStream video_stream;
     SrsSimpleStream audio_stream;
@@ -497,11 +585,19 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[3] == (char)0xBA)
 		{
             //ps header 
+            if (incomplete_len < (int)sizeof(SrsPsPacketHeader)) {
+                break;
+            }
             SrsPsPacketHeader *head = (SrsPsPacketHeader *)next_ps_pack;
             unsigned char pack_stuffing_length = head->stuffing_length & 0x07;
+
+            int ps_header_total = (int)sizeof(SrsPsPacketHeader) + pack_stuffing_length;
+            if (ps_header_total > incomplete_len) {
+                break;
+            }
         
-            next_ps_pack = next_ps_pack + sizeof(SrsPsPacketHeader) + pack_stuffing_length;
-            complete_len = complete_len + sizeof(SrsPsPacketHeader) + pack_stuffing_length;
+            next_ps_pack = next_ps_pack + ps_header_total;
+            complete_len = complete_len + ps_header_total;
             incomplete_len = ps_size - complete_len;
         }
         else if(next_ps_pack
@@ -511,10 +607,17 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[3] == (char)0xBB)
         {
             //ps system header 
+            if (incomplete_len < (int)sizeof(SrsPsPacketBBHeader)) {
+                break;
+            }
             SrsPsPacketBBHeader *bbhead=(SrsPsPacketBBHeader *)(next_ps_pack);
             int bbheaderlen = htons(bbhead->length);
-            next_ps_pack = next_ps_pack + sizeof(SrsPsPacketBBHeader) + bbheaderlen;
-            complete_len = complete_len + sizeof(SrsPsPacketBBHeader) + bbheaderlen;
+            int bb_total = (int)sizeof(SrsPsPacketBBHeader) + bbheaderlen;
+            if (bbheaderlen < 0 || bb_total > incomplete_len) {
+                break;
+            }
+            next_ps_pack = next_ps_pack + bb_total;
+            complete_len = complete_len + bb_total;
             incomplete_len = ps_size - complete_len;
 
             first_keyframe_flag = true;
@@ -526,12 +629,19 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[3] == (char)0xBC)
         {
             //program stream map 
-
+            if (incomplete_len < (int)sizeof(SrsPsMapPacket)) {
+                break;
+            }
 		    SrsPsMapPacket* psmap_pack = (SrsPsMapPacket*)next_ps_pack;
             psmap_pack->length = htons(psmap_pack->length);
+
+            int psmap_total = (int)psmap_pack->length + (int)sizeof(SrsPsMapPacket);
+            if ((int)psmap_pack->length < 0 || psmap_total > incomplete_len) {
+                break;
+            }
           
-            next_ps_pack = next_ps_pack + psmap_pack->length + sizeof(SrsPsMapPacket);
-            complete_len = complete_len + psmap_pack->length + sizeof(SrsPsMapPacket);
+            next_ps_pack = next_ps_pack + psmap_total;
+            complete_len = complete_len + psmap_total;
             incomplete_len = ps_size - complete_len;
 
             //parse ps map
@@ -595,13 +705,16 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[3] == (char)0xE0)
         {
             //pse video stream
+            if (incomplete_len < (int)sizeof(SrsPsePacket)) {
+                break;
+            }
             SrsPsePacket* pse_pack = (SrsPsePacket*)next_ps_pack;
 
             unsigned char pts_dts_flags = (pse_pack->info[0] & 0xF0) >> 6;
             //in a frame of data, pts is obtained from the first PSE packet
             if (pse_index == 0 && pts_dts_flags > 0) {
 				video_pts = parse_ps_timestamp((unsigned char*)next_ps_pack + 9);
-                srs_info("gb28181: ps stream video ts=%u pkt_ts=%u", video_pts, timestamp);
+                srs_verbose("gb28181: ps stream video ts=%u pkt_ts=%u", video_pts, timestamp);
 			}
             pse_index +=1;
 
@@ -614,6 +727,14 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
             if (payloadlen < 0 || payloadlen > incomplete_len - header_len) {
                 srs_warn("gb28181: invalid video PES payload length=%d, incomplete_len=%d, header_len=%d",
                          payloadlen, incomplete_len, header_len);
+                int skip = srs_gb_find_next_ps_pack(next_ps_pack, incomplete_len);
+                if (skip > 0 && ps_recover_count < max_recover) {
+                    ps_recover_count++;
+                    complete_len += skip;
+                    next_ps_pack += skip;
+                    incomplete_len = ps_size - complete_len;
+                    continue;
+                }
                 break;
             }
          
@@ -641,14 +762,30 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[3] == (char)0xBD)
         {
             //private stream 
-
+            if (incomplete_len < (int)sizeof(SrsPsePacket)) {
+                break;
+            }
 			SrsPsePacket* pse_pack = (SrsPsePacket*)next_ps_pack;
 			
             int packlength = htons(pse_pack->length);
 			int payload_len = packlength - 2 - 1 - pse_pack->stuffing_length;
+
+            // Validate payload length
+            int header_len = 9 + pse_pack->stuffing_length;
+            if (payload_len < 0 || payload_len > incomplete_len - header_len) {
+                int skip = srs_gb_find_next_ps_pack(next_ps_pack, incomplete_len);
+                if (skip > 0 && ps_recover_count < max_recover) {
+                    ps_recover_count++;
+                    complete_len += skip;
+                    next_ps_pack += skip;
+                    incomplete_len = ps_size - complete_len;
+                    continue;
+                }
+                break;
+            }
             
-			next_ps_pack = next_ps_pack + payload_len + 9 + pse_pack->stuffing_length;
-            complete_len = complete_len + (payload_len + 9 + pse_pack->stuffing_length);
+			next_ps_pack = next_ps_pack + payload_len + header_len;
+            complete_len = complete_len + (payload_len + header_len);
             incomplete_len = ps_size - complete_len;
 		}
 		else if (next_ps_pack
@@ -658,7 +795,9 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[3] == (char)0xC0)
         {
             //audio stream
-            
+            if (incomplete_len < (int)sizeof(SrsPsePacket)) {
+                break;
+            }
             SrsPsePacket* pse_pack = (SrsPsePacket*)next_ps_pack;
 
 		    unsigned char pts_dts_flags = (pse_pack->info[0] & 0xF0) >> 6;
@@ -676,6 +815,14 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
             if (payload_len < 0 || payload_len > incomplete_len - header_len) {
                 srs_warn("gb28181: invalid audio PES payload length=%d, incomplete_len=%d, header_len=%d",
                          payload_len, incomplete_len, header_len);
+                int skip = srs_gb_find_next_ps_pack(next_ps_pack, incomplete_len);
+                if (skip > 0 && ps_recover_count < max_recover) {
+                    ps_recover_count++;
+                    complete_len += skip;
+                    next_ps_pack += skip;
+                    incomplete_len = ps_size - complete_len;
+                    continue;
+                }
                 break;
             }
             
@@ -702,7 +849,7 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
                 if ((err2 = aac->adts_demux(&avs, &frame, &frame_size, codec)) != srs_success) {
                     srs_info("gb28181: client_id %s, audio data not aac adts (%#x/%u) %02x %02x\n",
                              channel_id.c_str(), ssrc, timestamp, p1, p2);  
-                    srs_error_reset(err);
+                    srs_error_reset(err2);
                 }else{
                     srs_warn("gb28181: client_id %s, ps map is not aac (%s) type, but stream many be aac adts, try update type",
                          channel_id.c_str(), get_ps_map_type_str(audio_es_type).c_str());
@@ -760,6 +907,16 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
             srs_trace("gb28181: client_id %s, unkonw ps data (%#x/%u) %02x %02x %02x %02x\n", 
                 channel_id.c_str(), ssrc, timestamp,  
                 next_ps_pack[0]&0xFF, next_ps_pack[1]&0xFF, next_ps_pack[2]&0xFF, next_ps_pack[3]&0xFF);
+
+            int skip = srs_gb_find_next_ps_pack(next_ps_pack, incomplete_len);
+            if (skip > 0 && ps_recover_count < max_recover) {
+                ps_recover_count++;
+                complete_len += skip;
+                next_ps_pack += skip;
+                incomplete_len = ps_size - complete_len;
+                continue;
+            }
+
             break;
         }
     }
@@ -767,11 +924,19 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
     if (complete_len != ps_size){
          srs_trace("gb28181: client_id %s decode ps packet error (%#x/%u)! ps_size=%d  complete=%d \n", 
                      channel_id.c_str(), ssrc, timestamp, ps_size, complete_len);
-    }else if (hander && video_stream.length() && can_send_ps_av_packet() && 
-              (video_es_type == STREAM_TYPE_VIDEO_H264 || video_es_type == STREAM_TYPE_VIDEO_HEVC)) {
-         if ((err = hander->on_rtp_video(&video_stream, video_pts, video_es_type)) != srs_success) {
-            video_es_type = 0;
-            return srs_error_wrap(err, "process ps video packet");
+         ps_recover_count = 0;
+    } else {
+        if (ps_recover_count > 0) {
+            srs_warn("gb28181: client_id %s ps stream recovered, retry=%d, ts=%u",
+                     channel_id.c_str(), ps_recover_count, timestamp);
+            ps_recover_count = 0;
+        }
+        if (hander && video_stream.length() && can_send_ps_av_packet() &&
+            (video_es_type == STREAM_TYPE_VIDEO_H264 || video_es_type == STREAM_TYPE_VIDEO_HEVC)) {
+            if ((err = hander->on_rtp_video(&video_stream, video_pts, video_es_type)) != srs_success) {
+                video_es_type = 0;
+                return srs_error_wrap(err, "process ps video packet");
+            }
         }
     }
   
@@ -1257,6 +1422,19 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     //srs_cond_signal(wait_ps_queue);
 }
 
+void SrsGb28181RtmpMuxer::jitterbuffer_recover_from_rtp_gap(uint32_t ssrc, int gap, const std::string& peer_ip, int peer_port)
+{
+    if (gap <= 0) {
+        return;
+    }
+
+    jitter_buffer->Flush();
+    jitter_buffer_audio->Flush();
+
+    srs_warn("gb28181: jitter buffer recover by rtp gap=%d, client_id=%s, ssrc=%#x, peer=%s:%d",
+        gap, channel_id.c_str(), ssrc, peer_ip.c_str(), peer_port);
+}
+
 void SrsGb28181RtmpMuxer::ps_packet_enqueue(SrsPsRtpPacket *pkt)
 {
     srs_assert(pkt);
@@ -1326,7 +1504,7 @@ srs_error_t SrsGb28181RtmpMuxer::on_rtp_video(SrsSimpleStream *stream, int64_t f
     // ts tbn to flv tbn.
     uint32_t dts = (uint32_t)(fpts / 90);
     uint32_t pts = (uint32_t)(fpts / 90);
-    srs_info("gb28181rtmpmuxer: on_rtp_video dts=%u, video_type=%d", dts, video_type);
+    srs_verbose("gb28181rtmpmuxer: on_rtp_video dts=%u, video_type=%d", dts, video_type);
     
     char *data = stream->bytes();
     int length = stream->length();
@@ -1399,7 +1577,7 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame2(char *frame, int frame_si
         return err;
     }
 
-    srs_info("gb28181: demux avc ibp frame size=%d, dts=%d", frame_size, dts);
+    srs_verbose("gb28181: demux avc ibp frame size=%d, dts=%d", frame_size, dts);
     if ((err = write_h264_ipb_frame(frame, frame_size, dts, pts)) != srs_success) {
         return srs_error_wrap(err, "write frame");
     }
@@ -1411,68 +1589,38 @@ srs_error_t SrsGb28181RtmpMuxer::write_h264_ipb_frame2(char *frame, int frame_si
  {
     srs_error_t err = srs_success;
 
-    int index = 0;
-    std::list<int> list_index;
-
-    for(; index < size; index++){
-        if (index > (size-4))
-            break;
-        if (video_data[index] == 0x00 && video_data[index+1] == 0x00 &&
-             video_data[index+2] == 0x00 && video_data[index+3] == 0x01){
-                 list_index.push_back(index);
-             }
+    if (!video_data || size <= 0) {
+        return err;
     }
 
-    if (list_index.size() == 1){
-        int cur_pos = list_index.front();
-        list_index.pop_front();
+    std::vector<int> startcodes;
+    startcodes.reserve(8);
 
-        //0001xxxxxxxxxx
-        //xxxx0001xxxxxxx
-        uint32_t naluLen = size - cur_pos - 4;
-        
-        char *frame = video_data + cur_pos + 4;
-        int frame_size = naluLen;
-
-        err = write_h264_ipb_frame2(frame, frame_size, dts, pts);
-
-    }else if (list_index.size() > 1){
-        int pre_pos = list_index.front();
-        list_index.pop_front();
-        int first_pos = pre_pos;
-
-        while(list_index.size() > 0){
-            int cur_pos = list_index.front();
-            list_index.pop_front();
-
-            //pre=========cur======================
-            //0001xxxxxxxx0001xxxxxxxx0001xxxxxxxxx
-            //xxxxxxxxxxxx0001xxxxxxxx0001xxxxxxxxx
-            uint32_t naluLen = cur_pos - pre_pos - 4;
-            
-            char *frame = video_data + pre_pos + 4;
-            int frame_size = naluLen;
-
-            pre_pos = cur_pos;
-            err = write_h264_ipb_frame2(frame, frame_size, dts, pts);
+    for (int index = 0; index + 3 < size; ++index) {
+        if (video_data[index] == 0x00 && video_data[index + 1] == 0x00 &&
+            video_data[index + 2] == 0x00 && video_data[index + 3] == 0x01) {
+            startcodes.push_back(index);
         }
-        
-        //========================pre==========
-        //0001xxxxxxxx0001xxxxxxxx0001xxxxxxxxx
-        if (first_pos != pre_pos){
+    }
 
-            uint32_t naluLen = size - pre_pos - 4;
-            
-            char *frame = video_data + pre_pos + 4;
-            int frame_size = naluLen;
-
-            err = write_h264_ipb_frame2(frame, frame_size, dts, pts);
-        }
-    }else{
-        //xxxxxxxxxxxxxxxxxxx
+    if (startcodes.empty()) {
         char *frame = video_data;
         int frame_size = size;
-        err = write_h264_ipb_frame2(frame, frame_size, dts, pts);
+        return write_h264_ipb_frame2(frame, frame_size, dts, pts);
+    }
+
+    for (size_t i = 0; i < startcodes.size(); ++i) {
+        int start = startcodes[i] + 4;
+        int end = (i + 1 < startcodes.size()) ? startcodes[i + 1] : size;
+        if (end <= start) {
+            continue;
+        }
+
+        char *frame = video_data + start;
+        int frame_size = end - start;
+        if ((err = write_h264_ipb_frame2(frame, frame_size, dts, pts)) != srs_success) {
+            return err;
+        }
     }
 
     return err;
@@ -1482,59 +1630,38 @@ srs_error_t SrsGb28181RtmpMuxer::replace_startcode_with_nalulen_hevc(char *video
 {
     srs_error_t err = srs_success;
 
-    int index = 0;
-    std::list<int> list_index;
-
-    for(; index < size; index++){
-        if (index > (size-4))
-            break;
-        if (video_data[index] == 0x00 && video_data[index+1] == 0x00 &&
-             video_data[index+2] == 0x00 && video_data[index+3] == 0x01){
-                 list_index.push_back(index);
-             }
+    if (!video_data || size <= 0) {
+        return err;
     }
 
-    if (list_index.size() == 1){
-        int cur_pos = list_index.front();
-        list_index.pop_front();
+    std::vector<int> startcodes;
+    startcodes.reserve(8);
 
-        uint32_t naluLen = size - cur_pos - 4;
-        
-        char *frame = video_data + cur_pos + 4;
-        int frame_size = naluLen;
-
-        err = write_h265_ipb_frame2(frame, frame_size, dts, pts);
-
-    }else if (list_index.size() > 1){
-        int pre_pos = list_index.front();
-        list_index.pop_front();
-        int first_pos = pre_pos;
-
-        while(list_index.size() > 0){
-            int cur_pos = list_index.front();
-            list_index.pop_front();
-
-            uint32_t naluLen = cur_pos - pre_pos - 4;
-            
-            char *frame = video_data + pre_pos + 4;
-            int frame_size = naluLen;
-
-            pre_pos = cur_pos;
-            err = write_h265_ipb_frame2(frame, frame_size, dts, pts);
+    for (int index = 0; index + 3 < size; ++index) {
+        if (video_data[index] == 0x00 && video_data[index + 1] == 0x00 &&
+            video_data[index + 2] == 0x00 && video_data[index + 3] == 0x01) {
+            startcodes.push_back(index);
         }
-        
-        if (first_pos != pre_pos){
-            uint32_t naluLen = size - pre_pos - 4;
-            
-            char *frame = video_data + pre_pos + 4;
-            int frame_size = naluLen;
+    }
 
-            err = write_h265_ipb_frame2(frame, frame_size, dts, pts);
-        }
-    }else{
+    if (startcodes.empty()) {
         char *frame = video_data;
         int frame_size = size;
-        err = write_h265_ipb_frame2(frame, frame_size, dts, pts);
+        return write_h265_ipb_frame2(frame, frame_size, dts, pts);
+    }
+
+    for (size_t i = 0; i < startcodes.size(); ++i) {
+        int start = startcodes[i] + 4;
+        int end = (i + 1 < startcodes.size()) ? startcodes[i + 1] : size;
+        if (end <= start) {
+            continue;
+        }
+
+        char *frame = video_data + start;
+        int frame_size = end - start;
+        if ((err = write_h265_ipb_frame2(frame, frame_size, dts, pts)) != srs_success) {
+            return err;
+        }
     }
 
     return err;
@@ -1621,7 +1748,7 @@ srs_error_t SrsGb28181RtmpMuxer::write_h265_ipb_frame2(char *frame, int frame_si
         return err;
     }
 
-    srs_info("gb28181: demux hevc ibp frame size=%d, dts=%d", frame_size, dts);
+    srs_verbose("gb28181: demux hevc ibp frame size=%d, dts=%d", frame_size, dts);
     if ((err = write_h265_ipb_frame(frame, frame_size, dts, pts)) != srs_success) {
         return srs_error_wrap(err, "write frame");
     }
@@ -1718,6 +1845,10 @@ srs_error_t SrsGb28181RtmpMuxer::on_rtp_audio(SrsSimpleStream* stream, int64_t f
             //and send the av header again next time
             h264_sps = "";
             h264_pps = "";
+            h265_vps = "";
+            h265_sps = "";
+            h265_pps = "";
+            hevc_vps_sps_pps_sent = false;
             aac_specific_config = "";
             return srs_error_wrap(err, "connect");
         }
@@ -2027,6 +2158,11 @@ void SrsGb28181RtmpMuxer::close()
     // RTMP close may stop through API(rtmp_close)
     h264_sps = "";
     h264_pps = "";
+    h265_vps = "";
+    h265_sps = "";
+    h265_pps = "";
+    hevc_vps_sps_pps_sent = false;
+    hevc_vps_sps_pps_changed = false;
     aac_specific_config = "";
 
     // BUGFIX: if don't unpublish, it will always be in the /api/v1/streams list
