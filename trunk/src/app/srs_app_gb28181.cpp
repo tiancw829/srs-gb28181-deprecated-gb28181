@@ -1382,7 +1382,6 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     if (!pkt->payload || pkt->payload->length() < 4) {
         // Payload too small, still insert but skip audio/video detection
         if (pkt->payload && pkt->payload->length() > 0) {
-            pkt->marker = false;
             jitter_buffer->InsertPacket(pkt->sequence_number, pkt->timestamp, pkt->marker, 
                     pkt->payload->bytes(), pkt->payload->length(), NULL);
             ps_rtp_video_ts = pkt->timestamp;
@@ -1410,7 +1409,6 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     //if both audio and video use jitter_buffer, 
     //otherwise audio uses jitter_buffer_audio, and video uses jitter_buffer
     if (av_same_ts){
-        pkt->marker = false;
         jitter_buffer->InsertPacket(pkt->sequence_number, pkt->timestamp, pkt->marker, 
                 pkt->payload->bytes(), pkt->payload->length(), NULL);
         ps_rtp_video_ts = pkt->timestamp;
