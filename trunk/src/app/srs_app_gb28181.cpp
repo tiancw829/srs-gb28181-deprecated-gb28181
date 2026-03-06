@@ -1184,9 +1184,10 @@ srs_error_t SrsGb28181RtmpMuxer::initialize(SrsServer *s, SrsRequest* r)
     }
 
     jitter_buffer_audio->SetDecodeErrorMode(kSelectiveErrors);
-    jitter_buffer_audio->SetNackMode(kNack, -1, -1);
-    // Audio favors low latency and should recover faster on sustained loss.
-    jitter_buffer_audio->SetNackSettings(150, 80, 0);
+    // Audio and video share the same RTP sequence number space in GB28181
+    // PS-over-RTP. NACK tracking on the audio JB produces false positives
+    // because interleaved video sequence numbers appear as "missing" packets.
+    jitter_buffer_audio->SetNackMode(kNoNack, -1, -1);
 
     if (!source_publish) return err;
 
