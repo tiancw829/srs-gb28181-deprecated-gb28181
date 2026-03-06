@@ -2005,9 +2005,9 @@ void SrsRtpJitterBuffer::SetNackSettings(size_t max_nack_list_size,
     assert(max_packet_age_to_nack >= 0);
     assert(max_incomplete_time_ms_ >= 0);
     max_nack_list_size_ = max_nack_list_size;
-    // OPTIMIZATION: Reduce threshold from 450 (15s @ 30fps) to 150 (5s) for faster key frame request
-    // In severe packet loss scenarios (like gap=5261), waiting 15s is too long
-    max_packet_age_to_nack_ = srs_min(max_packet_age_to_nack, 150);
+    // Keep enough room for large keyframes, but avoid very large values
+    // that delay keyframe fallback in sustained packet loss.
+    max_packet_age_to_nack_ = srs_min(max_packet_age_to_nack, 350);
     max_incomplete_time_ms_ = max_incomplete_time_ms;
     nack_seq_nums_.resize(max_nack_list_size_);
 }

@@ -1176,7 +1176,8 @@ srs_error_t SrsGb28181RtmpMuxer::initialize(SrsServer *s, SrsRequest* r)
 
     jitter_buffer->SetDecodeErrorMode(kSelectiveErrors);
     jitter_buffer->SetNackMode(kNack, -1, -1);
-    jitter_buffer->SetNackSettings(250, 450, 0);
+    // Video favors recovery on burst loss but should avoid overlong NACK waiting.
+    jitter_buffer->SetNackSettings(300, 250, 0);
 
     if (!jitter_buffer_audio) {
         jitter_buffer_audio = new SrsRtpJitterBuffer(channel_id);
@@ -1184,7 +1185,8 @@ srs_error_t SrsGb28181RtmpMuxer::initialize(SrsServer *s, SrsRequest* r)
 
     jitter_buffer_audio->SetDecodeErrorMode(kSelectiveErrors);
     jitter_buffer_audio->SetNackMode(kNack, -1, -1);
-    jitter_buffer_audio->SetNackSettings(250, 450, 0);
+    // Audio favors low latency and should recover faster on sustained loss.
+    jitter_buffer_audio->SetNackSettings(150, 80, 0);
 
     if (!source_publish) return err;
 
