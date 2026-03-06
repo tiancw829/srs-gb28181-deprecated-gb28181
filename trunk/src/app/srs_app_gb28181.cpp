@@ -574,7 +574,7 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 #endif
 
 	while(incomplete_len > 0 
-        && incomplete_len >= sizeof(SrsPsPacketStartCode))
+        && incomplete_len >= (int)sizeof(SrsPsPacketStartCode))
     {
     	if (next_ps_pack
 			&& next_ps_pack[0] == (char)0x00
@@ -1418,6 +1418,8 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     }else {
         jitter_buffer_audio->InsertPacket(pkt->sequence_number, pkt->timestamp, pkt->marker,
                 pkt->payload->bytes(), pkt->payload->length(), NULL);
+        // This audio seq was diverted; tell the video JB it's not missing.
+        jitter_buffer->EraseFromNackList(pkt->sequence_number);
     }
  
     //srs_cond_signal(wait_ps_queue);

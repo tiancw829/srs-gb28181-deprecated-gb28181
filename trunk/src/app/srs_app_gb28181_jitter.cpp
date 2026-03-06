@@ -2012,6 +2012,21 @@ void SrsRtpJitterBuffer::SetNackSettings(size_t max_nack_list_size,
     nack_seq_nums_.resize(max_nack_list_size_);
 }
 
+void SrsRtpJitterBuffer::EraseFromNackList(uint16_t sequence_number)
+{
+    if (nack_mode_ == kNoNack) return;
+
+    missing_sequence_numbers_.erase(sequence_number);
+
+    // Also advance latest_received_sequence_number_ so that future
+    // UpdateNackList() calls won't re-add this (or earlier) diverted
+    // sequence numbers into the missing set.
+    if (!first_packet_since_reset_) {
+        latest_received_sequence_number_ = LatestSequenceNumber(
+            latest_received_sequence_number_, sequence_number);
+    }
+}
+
 SrsRtpNackMode SrsRtpJitterBuffer::nack_mode() const
 {
     return nack_mode_;
