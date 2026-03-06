@@ -321,8 +321,6 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
     }
 
     bool drop_packet = false;
-    bool need_recover = false;
-    int gap = 0;
     static const int kMaxRtpRecover = 16;
     static const int kMaxRtpReorder = 128;
 
@@ -342,12 +340,11 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
                     channel_id.c_str(), pkt->ssrc, pkt->sequence_number, last_seq, address_string, peer_port);
             }
         } else if (delta > 1) {
-            gap = (int)delta - 1;
+            int gap = (int)delta - 1;
             int& recover_count = rtp_recover_count_by_ssrc[pkt->ssrc];
             recover_count++;
 
             if (recover_count <= kMaxRtpRecover) {
-                need_recover = true;
                 srs_warn("gb28181 ps rtp: seq gap=%d, recover=%d/%d, client_id=%s, ssrc=%#x, last=%u, cur=%u, peer=%s:%d",
                     gap, recover_count, kMaxRtpRecover, channel_id.c_str(), pkt->ssrc,
                     last_seq, pkt->sequence_number, address_string, peer_port);
@@ -390,9 +387,6 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
   
     SrsGb28181RtmpMuxer *muxer = fetch_rtmpmuxer(channel_id, pkt->ssrc);
     if (muxer){
-        // if (need_recover) {
-        //     muxer->jitterbuffer_recover_from_rtp_gap(pkt->ssrc, gap, address_string, peer_port);
-        // }
         rtmpmuxer_enqueue_data(muxer, pkt->ssrc, peer_port, address_string, pkt);
     }
     // pkt will be automatically freed by SrsAutoFree when function returns
@@ -555,7 +549,11 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
                  ps_size, (int)sizeof(SrsPsPacketStartCode));
         return srs_success;
     }
-    
+
+    // Reset per-frame PS recovery counter at entry (each call processes one independent PS frame).
+    // Reference: new SRS quit_recover_mode() resets on valid pack header, here we reset per-frame.
+    ps_recover_count = 0;
+
     int complete_len = 0;
     int incomplete_len = ps_size;
     char *next_ps_pack = ps_data;
@@ -897,14 +895,15 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
                 incomplete_len);
 
             // Compatibility fallback for some devices (for example some Dahua streams)
-            // where PS header may be lost and payload starts with 00 00 00 01.
+            // where PS header may be lost and payload starts with bare NALU start code 00 00 00 01.
+            // Cannot recover PS structure from this point; consume all remaining data and stop.
             if (next_ps_pack
                 && next_ps_pack[0] == (char)0x00
                 && next_ps_pack[1] == (char)0x00
                 && next_ps_pack[2] == (char)0x00
                 && next_ps_pack[3] == (char)0x01) {
-                incomplete_len = ps_size - complete_len;
-                complete_len = complete_len + incomplete_len;
+                complete_len = ps_size; // consume all remaining
+                break;
             }
 
             // Try to find the next valid PS pack header (00 00 01 BA) to recover
@@ -927,12 +926,10 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
     if (complete_len != ps_size){
          srs_trace("gb28181: client_id %s decode ps packet error (%#x/%u)! ps_size=%d  complete=%d \n", 
                      channel_id.c_str(), ssrc, timestamp, ps_size, complete_len);
-         ps_recover_count = 0;
     } else {
         if (ps_recover_count > 0) {
             srs_warn("gb28181: client_id %s ps stream recovered, retry=%d, ts=%u",
                      channel_id.c_str(), ps_recover_count, timestamp);
-            ps_recover_count = 0;
         }
         if (hander && video_stream.length() && can_send_ps_av_packet() &&
             (video_es_type == STREAM_TYPE_VIDEO_H264 || video_es_type == STREAM_TYPE_VIDEO_HEVC)) {
@@ -1425,18 +1422,6 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     //srs_cond_signal(wait_ps_queue);
 }
 
-void SrsGb28181RtmpMuxer::jitterbuffer_recover_from_rtp_gap(uint32_t ssrc, int gap, const std::string& peer_ip, int peer_port)
-{
-    if (gap <= 0) {
-        return;
-    }
-
-    jitter_buffer->Flush();
-    jitter_buffer_audio->Flush();
-
-    srs_warn("gb28181: jitter buffer recover by rtp gap=%d, client_id=%s, ssrc=%#x, peer=%s:%d",
-        gap, channel_id.c_str(), ssrc, peer_ip.c_str(), peer_port);
-}
 
 void SrsGb28181RtmpMuxer::ps_packet_enqueue(SrsPsRtpPacket *pkt)
 {

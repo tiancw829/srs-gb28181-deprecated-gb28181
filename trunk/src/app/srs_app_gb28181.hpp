@@ -341,7 +341,6 @@ public:
     srs_utime_t get_recv_stream_time();
 
     void insert_jitterbuffer(SrsPsRtpPacket *pkt);
-    void jitterbuffer_recover_from_rtp_gap(uint32_t ssrc, int gap, const std::string& peer_ip, int peer_port);
 
 private:
     virtual srs_error_t do_cycle();
