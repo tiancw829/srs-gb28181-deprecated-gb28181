@@ -1418,8 +1418,10 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     }else {
         jitter_buffer_audio->InsertPacket(pkt->sequence_number, pkt->timestamp, pkt->marker,
                 pkt->payload->bytes(), pkt->payload->length(), NULL);
-        // This audio seq was diverted; tell the video JB it's not missing.
-        jitter_buffer->EraseFromNackList(pkt->sequence_number);
+        // Audio and video share one RTP sequence space. Record the diverted
+        // audio packet so the video jitter buffer keeps true transport gaps
+        // while excluding this sequence number from its NACK set.
+        jitter_buffer->RecordSkippedPacket(pkt->sequence_number);
     }
  
     //srs_cond_signal(wait_ps_queue);

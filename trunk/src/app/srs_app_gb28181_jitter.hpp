@@ -409,6 +409,7 @@ public:
     uint16_t* GetNackList(uint16_t* nack_list_size, bool* request_key_frame);
     void Flush();
     void ResetJittter();
+    void RecordSkippedPacket(uint16_t sequence_number);
 
     bool isFirstKeyFrame;
 private:
@@ -437,11 +438,6 @@ private:
     bool MissingTooOldPacket(uint16_t latest_sequence_number) const;
     bool HandleTooOldPackets(uint16_t latest_sequence_number);
     void DropPacketsFromNackList(uint16_t last_decoded_sequence_number);
-public:
-    // Remove a single sequence number from the NACK missing list.
-    // Used when a packet is intentionally diverted to another jitter buffer
-    // (e.g., audio/video sharing the same RTP sequence number space).
-    void EraseFromNackList(uint16_t sequence_number);
 private:
     SrsRtpNackMode nack_mode() const;
     int NonContinuousOrIncompleteDuration();

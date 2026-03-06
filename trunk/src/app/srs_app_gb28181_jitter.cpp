@@ -2005,25 +2005,49 @@ void SrsRtpJitterBuffer::SetNackSettings(size_t max_nack_list_size,
     assert(max_packet_age_to_nack >= 0);
     assert(max_incomplete_time_ms_ >= 0);
     max_nack_list_size_ = max_nack_list_size;
-    // Keep enough room for large keyframes, but avoid very large values
-    // that delay keyframe fallback in sustained packet loss.
-    max_packet_age_to_nack_ = srs_min(max_packet_age_to_nack, 350);
+    // Keep recovery aggressive enough under sustained loss to avoid long
+    // stalls before the jitter buffer falls back to a newer key frame.
+    max_packet_age_to_nack_ = srs_min(max_packet_age_to_nack, 150);
     max_incomplete_time_ms_ = max_incomplete_time_ms;
     nack_seq_nums_.resize(max_nack_list_size_);
 }
 
-void SrsRtpJitterBuffer::EraseFromNackList(uint16_t sequence_number)
+void SrsRtpJitterBuffer::RecordSkippedPacket(uint16_t sequence_number)
 {
-    if (nack_mode_ == kNoNack) return;
+    if (nack_mode_ == kNoNack) {
+        return;
+    }
 
+    if (first_packet_since_reset_) {
+        latest_received_sequence_number_ = sequence_number;
+        first_packet_since_reset_ = false;
+        return;
+    }
+
+    if (!last_decoded_state_.in_initial_state()) {
+        latest_received_sequence_number_ = LatestSequenceNumber(
+            latest_received_sequence_number_, last_decoded_state_.sequence_num());
+    }
+
+    if (IsNewerSequenceNumber(sequence_number, latest_received_sequence_number_)) {
+        for (uint16_t i = latest_received_sequence_number_ + 1;
+                IsNewerSequenceNumber(sequence_number, i); ++i) {
+            missing_sequence_numbers_.insert(missing_sequence_numbers_.end(), i);
+        }
+
+        latest_received_sequence_number_ = sequence_number;
+    }
+
+    // The packet was observed on the shared RTP sequence space, but decoded by
+    // another jitter buffer. Remove it from this buffer's missing set.
     missing_sequence_numbers_.erase(sequence_number);
 
-    // Also advance latest_received_sequence_number_ so that future
-    // UpdateNackList() calls won't re-add this (or earlier) diverted
-    // sequence numbers into the missing set.
-    if (!first_packet_since_reset_) {
-        latest_received_sequence_number_ = LatestSequenceNumber(
-            latest_received_sequence_number_, sequence_number);
+    if (TooLargeNackList()) {
+        HandleTooLargeNackList();
+    }
+
+    if (MissingTooOldPacket(latest_received_sequence_number_)) {
+        HandleTooOldPackets(latest_received_sequence_number_);
     }
 }
 
