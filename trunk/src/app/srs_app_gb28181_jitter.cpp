@@ -1638,24 +1638,38 @@ bool SrsRtpJitterBuffer::NextMaybeIncompleteTimestamp(uint32_t* timestamp)
 
         oldest_frame = incomplete_frames_.Front();
         SrsRtpFrameBufferStateEnum oldest_frame_state = oldest_frame->GetState();
+        const int kLargeSeqRollbackThreshold = 1000;
 
         SrsRtpFrameBuffer* next_frame;
         next_frame = incomplete_frames_.FrontNext();
     
-        if (oldest_frame_state !=  kStateComplete && next_frame &&
-         IsNewerSequenceNumber(next_frame->GetLowSeqNum(), oldest_frame->GetHighSeqNum()) &&
-         next_frame->NumPackets() > 0 ) {
-            oldest_frame_state = kStateComplete;
+        if (oldest_frame_state != kStateComplete && next_frame && next_frame->NumPackets() > 0) {
+            if (IsNewerSequenceNumber(next_frame->GetLowSeqNum(), oldest_frame->GetHighSeqNum())) {
+                oldest_frame_state = kStateComplete;
+            } else if (IsNewerTimestamp(next_frame->GetTimeStamp(), oldest_frame->GetTimeStamp()) &&
+                       (int16_t)(next_frame->GetLowSeqNum() - oldest_frame->GetHighSeqNum()) < -kLargeSeqRollbackThreshold) {
+                // The next frame is newer in timestamp order, but its first sequence number
+                // looks far older than the end of the oldest frame. This is the 16-bit RTP
+                // sequence wrap blind spot for a very large forward jump and will otherwise
+                // leave the oldest incomplete frame stuck at the head forever.
+                srs_warn("RTP: jitbuffer key(%s) detected fatal sequence jump (%u,%d)->(%u,%d), distance=%d. Flush to break stalled oldest frame.",
+                    key_.c_str(), oldest_frame->GetTimeStamp(), oldest_frame->GetHighSeqNum(),
+                    next_frame->GetTimeStamp(), next_frame->GetLowSeqNum(),
+                    (int16_t)(next_frame->GetLowSeqNum() - oldest_frame->GetHighSeqNum()));
+                Flush();
+                return false;
+            }
         }
 
         // Frame will only be removed from buffer if it is complete (or decodable).
         if (oldest_frame_state < kStateComplete) {
             int oldest_frame_hight_seq = oldest_frame->GetHighSeqNum();
-            int next_frame_low_seq = next_frame->GetLowSeqNum();
+            int next_frame_low_seq = next_frame ? next_frame->GetLowSeqNum() : 0;
+            uint32_t next_frame_ts = next_frame ? next_frame->GetTimeStamp() : 0;
 
             srs_warn("RTP: jitbuffer NextMaybeIncompleteTimestamp key(%s) incomplete oldest_frame (%u,%d)->(%u,%d)",
                     key_.c_str(), oldest_frame->GetTimeStamp(), oldest_frame_hight_seq, 
-                    next_frame->GetTimeStamp(), next_frame_low_seq);
+                    next_frame_ts, next_frame_low_seq);
             return false;
         }
     } else {
