@@ -923,7 +923,8 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
         }
     }
 
-    if (complete_len != ps_size){
+    int unparsed_len = ps_size - complete_len;
+    if (unparsed_len >= (int)sizeof(SrsPsPacketStartCode)) {
          srs_trace("gb28181: client_id %s decode ps packet error (%#x/%u)! ps_size=%d  complete=%d \n", 
                      channel_id.c_str(), ssrc, timestamp, ps_size, complete_len);
     } else {
