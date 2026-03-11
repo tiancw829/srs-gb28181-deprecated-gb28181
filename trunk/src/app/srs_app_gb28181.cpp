@@ -700,7 +700,8 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[0] == (char)0x00
 			&& next_ps_pack[1] == (char)0x00
 			&& next_ps_pack[2] == (char)0x01
-			&& next_ps_pack[3] == (char)0xE0)
+			&& (uint8_t)next_ps_pack[3] >= PS_VIDEO_ID
+			&& (uint8_t)next_ps_pack[3] <= PS_VIDEO_ID_END)
         {
             //pse video stream
             if (incomplete_len < (int)sizeof(SrsPsePacket)) {
@@ -790,7 +791,8 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
 			&& next_ps_pack[0] == (char)0x00
 			&& next_ps_pack[1] == (char)0x00
 			&& next_ps_pack[2] == (char)0x01
-			&& next_ps_pack[3] == (char)0xC0)
+			&& (uint8_t)next_ps_pack[3] >= PS_AUDIO_ID
+			&& (uint8_t)next_ps_pack[3] <= PS_AUDIO_ID_END)
         {
             //audio stream
             if (incomplete_len < (int)sizeof(SrsPsePacket)) {
@@ -1404,7 +1406,8 @@ void SrsGb28181RtmpMuxer::insert_jitterbuffer(SrsPsRtpPacket *pkt)
     //check for rtp ps audio streaming
     bool av_same_ts = true;
 
-    if (p1 == 0x00 && p2 == 0x00 && p3 == 0x01 && p4 == 0xC0 &&
+    if (p1 == 0x00 && p2 == 0x00 && p3 == 0x01 && 
+        p4 >= PS_AUDIO_ID && p4 <= PS_AUDIO_ID_END &&
         ps_rtp_video_ts != pkt->timestamp) {
         av_same_ts = false;
     }
