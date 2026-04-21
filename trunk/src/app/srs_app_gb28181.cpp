@@ -73,9 +73,30 @@ srs_error_t SrsPsRtpPacket::decode(SrsBuffer* stream)
     sequence_number = stream->read_2bytes();
     timestamp = stream->read_4bytes();
     ssrc = stream->read_4bytes();
-    
-    // TODO: FIXME: check sequence number.
-    
+
+    // Skip CSRC list (each CSRC is 4 bytes).
+    int csrc_bytes = csrc_count * 4;
+    if (csrc_bytes > 0) {
+        if (!stream->require(csrc_bytes)) {
+            return srs_error_new(ERROR_RTP_HEADER_CORRUPT, "requires %d csrc bytes only %d left", csrc_bytes, stream->left());
+        }
+        stream->skip(csrc_bytes);
+    }
+
+    // Skip RTP header extension (RFC 3550 section 5.3.1).
+    if (extension) {
+        if (!stream->require(4)) {
+            return srs_error_new(ERROR_RTP_HEADER_CORRUPT, "requires 4 ext header bytes only %d left", stream->left());
+        }
+        stream->skip(2); // extension profile
+        uint16_t ext_len = stream->read_2bytes(); // length in 32-bit words
+        int ext_bytes = ext_len * 4;
+        if (!stream->require(ext_bytes)) {
+            return srs_error_new(ERROR_RTP_HEADER_CORRUPT, "requires %d ext bytes only %d left", ext_bytes, stream->left());
+        }
+        stream->skip(ext_bytes);
+    }
+
     // video codec.
     if (payload_type == 96) {
         // ps stream playload atleast 1bytes content.
@@ -83,7 +104,7 @@ srs_error_t SrsPsRtpPacket::decode(SrsBuffer* stream)
             return srs_error_new(ERROR_RTP_TYPE96_CORRUPT, "requires 1 only %d bytes", stream->left());
         }
         // append left bytes to payload.
-        payload->append(stream->data() + stream->pos() , stream->size()-stream->pos());
+        payload->append(stream->data() + stream->pos(), stream->size() - stream->pos());
     } else {
         return srs_error_new(ERROR_RTP_HEADER_CORRUPT, "unknown payload data");
     }
@@ -196,46 +217,38 @@ srs_error_t SrsGb28181PsRtpProcessor::on_tcp_packet(const sockaddr* from, const 
 
 SrsGb28181RtmpMuxer* SrsGb28181PsRtpProcessor::fetch_rtmpmuxer(std::string channel_id, uint32_t ssrc)
 {
-    if(true){
-        SrsGb28181RtmpMuxer* muxer = NULL;
-        //First, search according to the channel_id. Otherwise, search according to the SSRC. 
-        //Some channel_id are created by RTP pool, which are different ports. 
-        //No channel_id are created by multiplexing ports, which are the same port
-        if (!channel_id.empty()){
-            muxer = _srs_gb28181->fetch_rtmpmuxer(channel_id);
-        }else {
-            muxer = _srs_gb28181->fetch_rtmpmuxer_by_ssrc(ssrc);
+    SrsGb28181RtmpMuxer* muxer = NULL;
+
+    if (!channel_id.empty()){
+        muxer = _srs_gb28181->fetch_rtmpmuxer(channel_id);
+    }else {
+        muxer = _srs_gb28181->fetch_rtmpmuxer_by_ssrc(ssrc);
+    }
+
+    if (!muxer && config->auto_create_channel){
+        std::stringstream ss;
+        ss << "chid" << ssrc;
+        std::string tmp_id = ss.str();
+
+        SrsGb28181StreamChannel channel;
+        channel.set_channel_id(tmp_id);
+        if (!config->sip_invite_port_fixed) {
+            channel.set_port_mode(RTP_PORT_MODE_RANDOM);
+        }else{
+            channel.set_port_mode(RTP_PORT_MODE_FIXED);
         }
+        channel.set_ssrc(ssrc);
 
-        //auto crate channel
-        if (!muxer && config->auto_create_channel){
-            //auto create channel generated id
-            std::stringstream ss, ss1;
-            ss << "chid" << ssrc;
-            std::string tmp_id = ss.str();
+        srs_error_t err2 = srs_success;
+        if ((err2 = _srs_gb28181->create_stream_channel(&channel)) != srs_success){
+            srs_warn("gb28181: RtpProcessor create stream channel error %s", srs_error_desc(err2).c_str());
+            srs_error_reset(err2);
+        };
 
-            SrsGb28181StreamChannel channel;
-            channel.set_channel_id(tmp_id);
-            // channel.set_port_mode(RTP_PORT_MODE_FIXED); 
-            if (!config->sip_invite_port_fixed) {
-                channel.set_port_mode(RTP_PORT_MODE_RANDOM);
-            }else
-            {
-                channel.set_port_mode(RTP_PORT_MODE_FIXED);
-            }
-            channel.set_ssrc(ssrc);
-            
-            srs_error_t err2 = srs_success;
-            if ((err2 = _srs_gb28181->create_stream_channel(&channel)) != srs_success){
-                srs_warn("gb28181: RtpProcessor create stream channel error %s", srs_error_desc(err2).c_str());
-                srs_error_reset(err2);
-            };
+        muxer = _srs_gb28181->fetch_rtmpmuxer(tmp_id);
+    }
 
-            muxer = _srs_gb28181->fetch_rtmpmuxer(tmp_id);
-        }
-       
-        return muxer;
-    }//end if FoundFrame
+    return muxer;
 }
 
 srs_error_t SrsGb28181PsRtpProcessor::rtmpmuxer_enqueue_data(SrsGb28181RtmpMuxer *muxer, uint32_t ssrc, 
