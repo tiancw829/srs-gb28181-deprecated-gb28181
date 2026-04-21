@@ -311,13 +311,28 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
     }
     
     pkt->completed = pkt->marker;
-    
+
     if (pprint->can_print()) {
         srs_trace("<- " SRS_CONSTS_LOG_GB28181_CASTER " gb28181: client_id %s, peer(%s, %d) ps rtp packet %dB, age=%d, vt=%d/%u, sts=%u/%u/%#x, paylod=%dB",
-                    channel_id.c_str(),  address_string, peer_port, nb_buf, pprint->age(), pkt->version, 
+                    channel_id.c_str(),  address_string, peer_port, nb_buf, pprint->age(), pkt->version,
                     pkt->payload_type, pkt->sequence_number, pkt->timestamp, pkt->ssrc,
                     pkt->payload->length()
                     );
+    }
+
+    // Filter by peer port BEFORE sequence number detection, so that packets
+    // from a different source port don't pollute the sequence window.
+    SrsGb28181RtmpMuxer *muxer = fetch_rtmpmuxer(channel_id, pkt->ssrc);
+    if (muxer) {
+        muxer->set_channel_peer_port(peer_port);
+        muxer->set_channel_peer_ip(address_string);
+        if (muxer->channel_peer_port() != peer_port) {
+            if (pprint->can_print()) {
+                srs_warn("<- " SRS_CONSTS_LOG_GB28181_CASTER " gb28181: client_id %s, ssrc=%#x, first peer_port=%d cur peer_port=%d",
+                    muxer->get_channel_id().c_str(), pkt->ssrc, muxer->channel_peer_port(), peer_port);
+            }
+            return srs_success;
+        }
     }
 
     bool drop_packet = false;
@@ -333,7 +348,6 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
         int32_t delta = srs_seq_distance(pkt->sequence_number, last_seq);
 
         if (delta == 0) {
-            // Duplicate packet, drop to avoid disturbing jitter state.
             drop_packet = true;
             if (pprint->can_print()) {
                 srs_trace("gb28181 ps rtp: drop duplicate packet, client_id=%s, ssrc=%#x, seq=%u, last=%u, peer=%s:%d",
@@ -359,7 +373,6 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
         } else if (delta < 0) {
             int backward = -delta;
             if (backward <= kMaxRtpReorder) {
-                // Slight rollback is treated as out-of-order old packet.
                 drop_packet = true;
                 if (pprint->can_print()) {
                     srs_trace("gb28181 ps rtp: drop old packet, client_id=%s, ssrc=%#x, seq=%u, last=%u, rollback=%d, peer=%s:%d",
@@ -367,7 +380,6 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
                         backward, address_string, peer_port);
                 }
             } else {
-                // Large rollback usually means sender restarted/reset sequence.
                 srs_warn("gb28181 ps rtp: reset sequence window, client_id=%s, ssrc=%#x, seq=%u, last=%u, rollback=%d, peer=%s:%d",
                     channel_id.c_str(), pkt->ssrc, pkt->sequence_number, last_seq,
                     backward, address_string, peer_port);
@@ -375,7 +387,6 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
                 it_seq->second = pkt->sequence_number;
             }
         } else {
-            // Continuous sequence, reset recover counter.
             rtp_recover_count_by_ssrc[pkt->ssrc] = 0;
             it_seq->second = pkt->sequence_number;
         }
@@ -384,12 +395,10 @@ srs_error_t SrsGb28181PsRtpProcessor::on_rtp_packet_jitter(const sockaddr* from,
     if (drop_packet) {
         return srs_success;
     }
-  
-    SrsGb28181RtmpMuxer *muxer = fetch_rtmpmuxer(channel_id, pkt->ssrc);
-    if (muxer){
-        rtmpmuxer_enqueue_data(muxer, pkt->ssrc, peer_port, address_string, pkt);
+
+    if (muxer) {
+        muxer->insert_jitterbuffer(pkt);
     }
-    // pkt will be automatically freed by SrsAutoFree when function returns
 
     return err;
 }
