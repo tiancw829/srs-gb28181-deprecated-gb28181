@@ -671,22 +671,56 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
             SrsBuffer buf(p, (int)psmap_pack->length);
 
             psm_length =(int)psmap_pack->length;
+            if (!buf.require(4)) {
+                srs_warn("gb28181: invalid ps map, length=%d requires at least 4 bytes", psm_length);
+                continue;
+            }
+
             buf.read_1bytes();
             buf.read_1bytes();
 
             ps_info_length = buf.read_2bytes();
+            int ps_info_size = (int)ps_info_length;
+            if ((int)psm_length < ps_info_size + 10) {
+                srs_warn("gb28181: invalid ps map, length=%d ps_info_length=%d", psm_length, ps_info_length);
+                continue;
+            }
+
+            if (!buf.require(ps_info_size + 2)) {
+                srs_warn("gb28181: invalid ps map, ps_info_length=%d left=%d", ps_info_length, buf.left());
+                continue;
+            }
 
             /* skip program_stream_info */
-            buf.skip(ps_info_length);
+            buf.skip(ps_info_size);
             /*es_map_length = */buf.read_2bytes();
             /* Ignore es_map_length, trust psm_length */
-            es_map_length = psm_length - ps_info_length - 10;
+            es_map_length = (uint16_t)((int)psm_length - ps_info_size - 10);
+            int es_map_size = (int)es_map_length;
+            if (!buf.require(es_map_size + 4)) {
+                srs_warn("gb28181: invalid ps map, es_map_length=%d left=%d", es_map_length, buf.left());
+                continue;
+            }
+
+            SrsBuffer esbuf(buf.head(), es_map_size);
+            buf.skip(es_map_size);
         
             // /* at least one es available? */
-            while (es_map_length >= 4) {
-                uint8_t type      = buf.read_1bytes();
-                uint8_t es_id     = buf.read_1bytes();
-                uint16_t es_info_length = buf.read_2bytes();
+            while (!esbuf.empty()) {
+                if (!esbuf.require(4)) {
+                    srs_warn("gb28181: invalid ps map es entry, left=%d", esbuf.left());
+                    break;
+                }
+
+                uint8_t type      = esbuf.read_1bytes();
+                uint8_t es_id     = esbuf.read_1bytes();
+                uint16_t es_info_length = esbuf.read_2bytes();
+                if (!esbuf.require(es_info_length)) {
+                    srs_warn("gb28181: invalid ps map es_info_length=%d left=%d, es_type=%s(%x), es_id=%0x",
+                        es_info_length, esbuf.left(), get_ps_map_type_str(type).c_str(), type, es_id);
+                    break;
+                }
+
                 std::string s_type = get_ps_map_type_str(type);
 
                 /* remember mapping from stream id to stream type */
@@ -709,12 +743,8 @@ srs_error_t SrsPsStreamDemixer::on_ps_stream(char* ps_data, int ps_size, uint32_
                     video_es_type = type;
                 }
            
-                /* skip program_stream_info */
-                if (es_info_length + 4 < es_map_length){ 
-                    //check is es_info_length overflow es_map_length
-                    buf.skip(es_info_length);
-                }
-                es_map_length -= 4 + es_info_length;
+                /* skip elementary_stream_info */
+                esbuf.skip(es_info_length);
             }
     
         }

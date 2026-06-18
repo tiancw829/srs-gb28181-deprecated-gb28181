@@ -16,6 +16,10 @@ using namespace std;
 #include <srs_service_conn.hpp>
 #include <srs_app_conn.hpp>
 
+#ifdef SRS_GB28181
+#include <srs_app_gb28181.hpp>
+#endif
+
 class MockIDResource : public ISrsResource
 {
 public:
@@ -180,6 +184,49 @@ VOID TEST(AppCoroutineTest, Dummy)
         srs_freep(err);
     }
 }
+
+#ifdef SRS_GB28181
+VOID TEST(AppGb28181Test, PsMapRejectsOverflowEsInfoLength)
+{
+    srs_error_t err = srs_success;
+
+    char psm[] = {
+        0x00, 0x00, 0x01, (char)0xbc, 0x00, 0x0e,
+        (char)0xc0, (char)0xff, 0x00, 0x00,
+        0x00, 0x04,
+        0x09, (char)0xd9, (char)0xc2, 0x1c,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    SrsPsStreamDemixer demixer(NULL, "test", false, false);
+    HELPER_EXPECT_SUCCESS(demixer.on_ps_stream(psm, sizeof(psm), 0, 0));
+
+    EXPECT_EQ(0, demixer.audio_es_type);
+    EXPECT_EQ(0, demixer.video_es_type);
+}
+
+VOID TEST(AppGb28181Test, PsMapAcceptsValidStreamMappings)
+{
+    srs_error_t err = srs_success;
+
+    char psm[] = {
+        0x00, 0x00, 0x01, (char)0xbc, 0x00, 0x12,
+        (char)0xc0, (char)0xff, 0x00, 0x00,
+        0x00, 0x08,
+        STREAM_TYPE_VIDEO_H264, (char)0xe0, 0x00, 0x00,
+        STREAM_TYPE_AUDIO_AAC, (char)0xc0, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    SrsPsStreamDemixer demixer(NULL, "test", true, false);
+    HELPER_EXPECT_SUCCESS(demixer.on_ps_stream(psm, sizeof(psm), 0, 0));
+
+    EXPECT_EQ(STREAM_TYPE_AUDIO_AAC, demixer.audio_es_type);
+    EXPECT_EQ(STREAM_TYPE_VIDEO_H264, demixer.video_es_type);
+    EXPECT_EQ(PS_AUDIO_ID, demixer.audio_es_id);
+    EXPECT_EQ(PS_VIDEO_ID, demixer.video_es_id);
+}
+#endif
 
 class MockCoroutineHandler : public ISrsCoroutineHandler {
 public:
@@ -745,4 +792,3 @@ VOID TEST(AppSecurity, CheckSecurity)
     //       3. allow if matches allow strategy.
     //       4. deny if matches deny strategy.
 }
-
